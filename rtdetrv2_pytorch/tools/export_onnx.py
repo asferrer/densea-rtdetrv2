@@ -21,9 +21,34 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Import configuration (assuming it's in src.core)
 try:
     from src.core import YAMLConfig
+    from src.nn.backbone.common import FrozenBatchNorm2d
 except ImportError:
     logging.error("Could not import YAMLConfig from src.core. Ensure the project structure and PYTHONPATH are correct.")
     sys.exit(1)
+
+def replace_frozen_bn_with_bn(model: nn.Module) -> nn.Module:
+    """
+    Recursively replaces all instances of FrozenBatchNorm2d with a standard
+    nn.BatchNorm2d layer in evaluation mode.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, FrozenBatchNorm2d):
+            # Create a new standard BatchNorm2d layer
+            new_bn = nn.BatchNorm2d(module.num_features)
+            
+            # Copy the state from the FrozenBatchNorm2d layer
+            new_bn.load_state_dict(module.state_dict())
+            
+            # Set the new layer to evaluation mode to freeze its statistics
+            new_bn.eval()
+            
+            # Replace the old layer with the new one
+            setattr(model, name, new_bn)
+            logging.info(f"Replaced FrozenBatchNorm2d with nn.BatchNorm2d at: {name}")
+        else:
+            # Recurse into submodules
+            replace_frozen_bn_with_bn(module)
+    return model
 
 # --- Main Export Function ---
 def main(args):
@@ -74,127 +99,125 @@ def main(args):
             if self.postprocessor:
                  self.postprocessor.eval()
 
-            # 2. Perform Layer Fusion if requested
+            # 2. Replace FrozenBatchNorm2d before attempting fusion
+            logging.info("Replacing FrozenBatchNorm2d layers with standard nn.BatchNorm2d in eval mode...")
+            self.model = replace_frozen_bn_with_bn(self.model)
+
+            # 3. Perform Layer Fusion if requested
             if perform_fusion:
-                logging.info("Attempting layer fusion (Conv+BN)...")
-                try:
-                    # --- Specific module names for the provided RT-DETRv2 model structure ---
-                    modules_to_fuse = [
-                        # Backbone: Initial Layers
-                        ['backbone.conv1.conv1_1.conv', 'backbone.conv1.conv1_1.norm'],
-                        ['backbone.conv1.conv1_2.conv', 'backbone.conv1.conv1_2.norm'],
-                        ['backbone.conv1.conv1_3.conv', 'backbone.conv1.conv1_3.norm'],
-                        # Backbone: ResLayer 0
-                        ['backbone.res_layers.0.blocks.0.short.conv', 'backbone.res_layers.0.blocks.0.short.norm'],
-                        ['backbone.res_layers.0.blocks.0.branch2a.conv', 'backbone.res_layers.0.blocks.0.branch2a.norm'],
-                        ['backbone.res_layers.0.blocks.0.branch2b.conv', 'backbone.res_layers.0.blocks.0.branch2b.norm'],
-                        ['backbone.res_layers.0.blocks.1.branch2a.conv', 'backbone.res_layers.0.blocks.1.branch2a.norm'],
-                        ['backbone.res_layers.0.blocks.1.branch2b.conv', 'backbone.res_layers.0.blocks.1.branch2b.norm'],
-                        # Backbone: ResLayer 1
-                        ['backbone.res_layers.1.blocks.0.short.conv.conv', 'backbone.res_layers.1.blocks.0.short.conv.norm'], # Nested ConvNormLayer
-                        ['backbone.res_layers.1.blocks.0.branch2a.conv', 'backbone.res_layers.1.blocks.0.branch2a.norm'],
-                        ['backbone.res_layers.1.blocks.0.branch2b.conv', 'backbone.res_layers.1.blocks.0.branch2b.norm'],
-                        ['backbone.res_layers.1.blocks.1.branch2a.conv', 'backbone.res_layers.1.blocks.1.branch2a.norm'],
-                        ['backbone.res_layers.1.blocks.1.branch2b.conv', 'backbone.res_layers.1.blocks.1.branch2b.norm'],
-                        # Backbone: ResLayer 2
-                        ['backbone.res_layers.2.blocks.0.short.conv.conv', 'backbone.res_layers.2.blocks.0.short.conv.norm'], # Nested ConvNormLayer
-                        ['backbone.res_layers.2.blocks.0.branch2a.conv', 'backbone.res_layers.2.blocks.0.branch2a.norm'],
-                        ['backbone.res_layers.2.blocks.0.branch2b.conv', 'backbone.res_layers.2.blocks.0.branch2b.norm'],
-                        ['backbone.res_layers.2.blocks.1.branch2a.conv', 'backbone.res_layers.2.blocks.1.branch2a.norm'],
-                        ['backbone.res_layers.2.blocks.1.branch2b.conv', 'backbone.res_layers.2.blocks.1.branch2b.norm'],
-                        # Backbone: ResLayer 3
-                        ['backbone.res_layers.3.blocks.0.short.conv.conv', 'backbone.res_layers.3.blocks.0.short.conv.norm'], # Nested ConvNormLayer
-                        ['backbone.res_layers.3.blocks.0.branch2a.conv', 'backbone.res_layers.3.blocks.0.branch2a.norm'],
-                        ['backbone.res_layers.3.blocks.0.branch2b.conv', 'backbone.res_layers.3.blocks.0.branch2b.norm'],
-                        ['backbone.res_layers.3.blocks.1.branch2a.conv', 'backbone.res_layers.3.blocks.1.branch2a.norm'],
-                        ['backbone.res_layers.3.blocks.1.branch2b.conv', 'backbone.res_layers.3.blocks.1.branch2b.norm'],
-                        # Decoder Input Projections
-                        ['decoder.input_proj.0.conv', 'decoder.input_proj.0.norm'],
-                        ['decoder.input_proj.1.conv', 'decoder.input_proj.1.norm'],
-                        ['decoder.input_proj.2.conv', 'decoder.input_proj.2.norm'],
-                        # Encoder Input Projections
-                        ['encoder.input_proj.0.conv', 'encoder.input_proj.0.norm'],
-                        ['encoder.input_proj.1.conv', 'encoder.input_proj.1.norm'],
-                        ['encoder.input_proj.2.conv', 'encoder.input_proj.2.norm'],
-                        # Encoder Lateral Convs
-                        ['encoder.lateral_convs.0.conv', 'encoder.lateral_convs.0.norm'],
-                        ['encoder.lateral_convs.1.conv', 'encoder.lateral_convs.1.norm'],
-                        # Encoder FPN Blocks (CSPRepLayer 0)
-                        ['encoder.fpn_blocks.0.conv1.conv', 'encoder.fpn_blocks.0.conv1.norm'],
-                        ['encoder.fpn_blocks.0.conv2.conv', 'encoder.fpn_blocks.0.conv2.norm'],
-                        ['encoder.fpn_blocks.0.bottlenecks.0.conv1.conv', 'encoder.fpn_blocks.0.bottlenecks.0.conv1.norm'],
-                        ['encoder.fpn_blocks.0.bottlenecks.0.conv2.conv', 'encoder.fpn_blocks.0.bottlenecks.0.conv2.norm'],
-                        ['encoder.fpn_blocks.0.bottlenecks.1.conv1.conv', 'encoder.fpn_blocks.0.bottlenecks.1.conv1.norm'],
-                        ['encoder.fpn_blocks.0.bottlenecks.1.conv2.conv', 'encoder.fpn_blocks.0.bottlenecks.1.conv2.norm'],
-                        ['encoder.fpn_blocks.0.bottlenecks.2.conv1.conv', 'encoder.fpn_blocks.0.bottlenecks.2.conv1.norm'],
-                        ['encoder.fpn_blocks.0.bottlenecks.2.conv2.conv', 'encoder.fpn_blocks.0.bottlenecks.2.conv2.norm'],
-                        ['encoder.fpn_blocks.0.conv3.conv', 'encoder.fpn_blocks.0.conv3.norm'],
-                         # Encoder FPN Blocks (CSPRepLayer 1)
-                        ['encoder.fpn_blocks.1.conv1.conv', 'encoder.fpn_blocks.1.conv1.norm'],
-                        ['encoder.fpn_blocks.1.conv2.conv', 'encoder.fpn_blocks.1.conv2.norm'],
-                        ['encoder.fpn_blocks.1.bottlenecks.0.conv1.conv', 'encoder.fpn_blocks.1.bottlenecks.0.conv1.norm'],
-                        ['encoder.fpn_blocks.1.bottlenecks.0.conv2.conv', 'encoder.fpn_blocks.1.bottlenecks.0.conv2.norm'],
-                        ['encoder.fpn_blocks.1.bottlenecks.1.conv1.conv', 'encoder.fpn_blocks.1.bottlenecks.1.conv1.norm'],
-                        ['encoder.fpn_blocks.1.bottlenecks.1.conv2.conv', 'encoder.fpn_blocks.1.bottlenecks.1.conv2.norm'],
-                        ['encoder.fpn_blocks.1.bottlenecks.2.conv1.conv', 'encoder.fpn_blocks.1.bottlenecks.2.conv1.norm'],
-                        ['encoder.fpn_blocks.1.bottlenecks.2.conv2.conv', 'encoder.fpn_blocks.1.bottlenecks.2.conv2.norm'],
-                        ['encoder.fpn_blocks.1.conv3.conv', 'encoder.fpn_blocks.1.conv3.norm'],
-                        # Encoder Downsample Convs
-                        ['encoder.downsample_convs.0.conv', 'encoder.downsample_convs.0.norm'],
-                        ['encoder.downsample_convs.1.conv', 'encoder.downsample_convs.1.norm'],
-                        # Encoder PAN Blocks (CSPRepLayer 0)
-                        ['encoder.pan_blocks.0.conv1.conv', 'encoder.pan_blocks.0.conv1.norm'],
-                        ['encoder.pan_blocks.0.conv2.conv', 'encoder.pan_blocks.0.conv2.norm'],
-                        ['encoder.pan_blocks.0.bottlenecks.0.conv1.conv', 'encoder.pan_blocks.0.bottlenecks.0.conv1.norm'],
-                        ['encoder.pan_blocks.0.bottlenecks.0.conv2.conv', 'encoder.pan_blocks.0.bottlenecks.0.conv2.norm'],
-                        ['encoder.pan_blocks.0.bottlenecks.1.conv1.conv', 'encoder.pan_blocks.0.bottlenecks.1.conv1.norm'],
-                        ['encoder.pan_blocks.0.bottlenecks.1.conv2.conv', 'encoder.pan_blocks.0.bottlenecks.1.conv2.norm'],
-                        ['encoder.pan_blocks.0.bottlenecks.2.conv1.conv', 'encoder.pan_blocks.0.bottlenecks.2.conv1.norm'],
-                        ['encoder.pan_blocks.0.bottlenecks.2.conv2.conv', 'encoder.pan_blocks.0.bottlenecks.2.conv2.norm'],
-                        ['encoder.pan_blocks.0.conv3.conv', 'encoder.pan_blocks.0.conv3.norm'],
-                        # Encoder PAN Blocks (CSPRepLayer 1)
-                        ['encoder.pan_blocks.1.conv1.conv', 'encoder.pan_blocks.1.conv1.norm'],
-                        ['encoder.pan_blocks.1.conv2.conv', 'encoder.pan_blocks.1.conv2.norm'],
-                        ['encoder.pan_blocks.1.bottlenecks.0.conv1.conv', 'encoder.pan_blocks.1.bottlenecks.0.conv1.norm'],
-                        ['encoder.pan_blocks.1.bottlenecks.0.conv2.conv', 'encoder.pan_blocks.1.bottlenecks.0.conv2.norm'],
-                        ['encoder.pan_blocks.1.bottlenecks.1.conv1.conv', 'encoder.pan_blocks.1.bottlenecks.1.conv1.norm'],
-                        ['encoder.pan_blocks.1.bottlenecks.1.conv2.conv', 'encoder.pan_blocks.1.bottlenecks.1.conv2.norm'],
-                        ['encoder.pan_blocks.1.bottlenecks.2.conv1.conv', 'encoder.pan_blocks.1.bottlenecks.2.conv1.norm'],
-                        ['encoder.pan_blocks.1.bottlenecks.2.conv2.conv', 'encoder.pan_blocks.1.bottlenecks.2.conv2.norm'],
-                        ['encoder.pan_blocks.1.conv3.conv', 'encoder.pan_blocks.1.conv3.norm'],
-                    ]
+                logging.info("Attempting dynamic layer fusion (Conv+BN)...")
+                
+                # List of potential candidates for fusion
+                potential_fusion_candidates = [
+                    ['backbone.conv1.conv1_1.conv', 'backbone.conv1.conv1_1.norm'],
+                    ['backbone.conv1.conv1_2.conv', 'backbone.conv1.conv1_2.norm'],
+                    ['backbone.conv1.conv1_3.conv', 'backbone.conv1.conv1_3.norm'],
+                    ['backbone.res_layers.0.blocks.0.short.conv', 'backbone.res_layers.0.blocks.0.short.norm'],
+                    ['backbone.res_layers.0.blocks.0.branch2a.conv', 'backbone.res_layers.0.blocks.0.branch2a.norm'],
+                    ['backbone.res_layers.0.blocks.0.branch2b.conv', 'backbone.res_layers.0.blocks.0.branch2b.norm'],
+                    ['backbone.res_layers.0.blocks.1.branch2a.conv', 'backbone.res_layers.0.blocks.1.branch2a.norm'],
+                    ['backbone.res_layers.0.blocks.1.branch2b.conv', 'backbone.res_layers.0.blocks.1.branch2b.norm'],
+                    ['backbone.res_layers.1.blocks.0.short.conv.conv', 'backbone.res_layers.1.blocks.0.short.conv.norm'],
+                    ['backbone.res_layers.1.blocks.0.branch2a.conv', 'backbone.res_layers.1.blocks.0.branch2a.norm'],
+                    ['backbone.res_layers.1.blocks.0.branch2b.conv', 'backbone.res_layers.1.blocks.0.branch2b.norm'],
+                    ['backbone.res_layers.1.blocks.1.branch2a.conv', 'backbone.res_layers.1.blocks.1.branch2a.norm'],
+                    ['backbone.res_layers.1.blocks.1.branch2b.conv', 'backbone.res_layers.1.blocks.1.branch2b.norm'],
+                    ['backbone.res_layers.2.blocks.0.short.conv.conv', 'backbone.res_layers.2.blocks.0.short.conv.norm'],
+                    ['backbone.res_layers.2.blocks.0.branch2a.conv', 'backbone.res_layers.2.blocks.0.branch2a.norm'],
+                    ['backbone.res_layers.2.blocks.0.branch2b.conv', 'backbone.res_layers.2.blocks.0.branch2b.norm'],
+                    ['backbone.res_layers.2.blocks.1.branch2a.conv', 'backbone.res_layers.2.blocks.1.branch2a.norm'],
+                    ['backbone.res_layers.2.blocks.1.branch2b.conv', 'backbone.res_layers.2.blocks.1.branch2b.norm'],
+                    ['backbone.res_layers.3.blocks.0.short.conv.conv', 'backbone.res_layers.3.blocks.0.short.conv.norm'],
+                    ['backbone.res_layers.3.blocks.0.branch2a.conv', 'backbone.res_layers.3.blocks.0.branch2a.norm'],
+                    ['backbone.res_layers.3.blocks.0.branch2b.conv', 'backbone.res_layers.3.blocks.0.branch2b.norm'],
+                    ['backbone.res_layers.3.blocks.1.branch2a.conv', 'backbone.res_layers.3.blocks.1.branch2a.norm'],
+                    ['backbone.res_layers.3.blocks.1.branch2b.conv', 'backbone.res_layers.3.blocks.1.branch2b.norm'],
+                    ['decoder.input_proj.0.conv', 'decoder.input_proj.0.norm'],
+                    ['decoder.input_proj.1.conv', 'decoder.input_proj.1.norm'],
+                    ['decoder.input_proj.2.conv', 'decoder.input_proj.2.norm'],
+                    ['encoder.input_proj.0.conv', 'encoder.input_proj.0.norm'],
+                    ['encoder.input_proj.1.conv', 'encoder.input_proj.1.norm'],
+                    ['encoder.input_proj.2.conv', 'encoder.input_proj.2.norm'],
+                    ['encoder.lateral_convs.0.conv', 'encoder.lateral_convs.0.norm'],
+                    ['encoder.lateral_convs.1.conv', 'encoder.lateral_convs.1.norm'],
+                    ['encoder.fpn_blocks.0.conv1.conv', 'encoder.fpn_blocks.0.conv1.norm'],
+                    ['encoder.fpn_blocks.0.conv2.conv', 'encoder.fpn_blocks.0.conv2.norm'],
+                    ['encoder.fpn_blocks.0.bottlenecks.0.conv1.conv', 'encoder.fpn_blocks.0.bottlenecks.0.conv1.norm'],
+                    ['encoder.fpn_blocks.0.bottlenecks.0.conv2.conv', 'encoder.fpn_blocks.0.bottlenecks.0.conv2.norm'],
+                    ['encoder.fpn_blocks.0.bottlenecks.1.conv1.conv', 'encoder.fpn_blocks.0.bottlenecks.1.conv1.norm'],
+                    ['encoder.fpn_blocks.0.bottlenecks.1.conv2.conv', 'encoder.fpn_blocks.0.bottlenecks.1.conv2.norm'],
+                    ['encoder.fpn_blocks.0.bottlenecks.2.conv1.conv', 'encoder.fpn_blocks.0.bottlenecks.2.conv1.norm'],
+                    ['encoder.fpn_blocks.0.bottlenecks.2.conv2.conv', 'encoder.fpn_blocks.0.bottlenecks.2.conv2.norm'],
+                    ['encoder.fpn_blocks.0.conv3.conv', 'encoder.fpn_blocks.0.conv3.norm'],
+                    ['encoder.fpn_blocks.1.conv1.conv', 'encoder.fpn_blocks.1.conv1.norm'],
+                    ['encoder.fpn_blocks.1.conv2.conv', 'encoder.fpn_blocks.1.conv2.norm'],
+                    ['encoder.fpn_blocks.1.bottlenecks.0.conv1.conv', 'encoder.fpn_blocks.1.bottlenecks.0.conv1.norm'],
+                    ['encoder.fpn_blocks.1.bottlenecks.0.conv2.conv', 'encoder.fpn_blocks.1.bottlenecks.0.conv2.norm'],
+                    ['encoder.fpn_blocks.1.bottlenecks.1.conv1.conv', 'encoder.fpn_blocks.1.bottlenecks.1.conv1.norm'],
+                    ['encoder.fpn_blocks.1.bottlenecks.1.conv2.conv', 'encoder.fpn_blocks.1.bottlenecks.1.conv2.norm'],
+                    ['encoder.fpn_blocks.1.bottlenecks.2.conv1.conv', 'encoder.fpn_blocks.1.bottlenecks.2.conv1.norm'],
+                    ['encoder.fpn_blocks.1.bottlenecks.2.conv2.conv', 'encoder.fpn_blocks.1.bottlenecks.2.conv2.norm'],
+                    ['encoder.fpn_blocks.1.conv3.conv', 'encoder.fpn_blocks.1.conv3.norm'],
+                    ['encoder.downsample_convs.0.conv', 'encoder.downsample_convs.0.norm'],
+                    ['encoder.downsample_convs.1.conv', 'encoder.downsample_convs.1.norm'],
+                    ['encoder.pan_blocks.0.conv1.conv', 'encoder.pan_blocks.0.conv1.norm'],
+                    ['encoder.pan_blocks.0.conv2.conv', 'encoder.pan_blocks.0.conv2.norm'],
+                    ['encoder.pan_blocks.0.bottlenecks.0.conv1.conv', 'encoder.pan_blocks.0.bottlenecks.0.conv1.norm'],
+                    ['encoder.pan_blocks.0.bottlenecks.0.conv2.conv', 'encoder.pan_blocks.0.bottlenecks.0.conv2.norm'],
+                    ['encoder.pan_blocks.0.bottlenecks.1.conv1.conv', 'encoder.pan_blocks.0.bottlenecks.1.conv1.norm'],
+                    ['encoder.pan_blocks.0.bottlenecks.1.conv2.conv', 'encoder.pan_blocks.0.bottlenecks.1.conv2.norm'],
+                    ['encoder.pan_blocks.0.bottlenecks.2.conv1.conv', 'encoder.pan_blocks.0.bottlenecks.2.conv1.norm'],
+                    ['encoder.pan_blocks.0.bottlenecks.2.conv2.conv', 'encoder.pan_blocks.0.bottlenecks.2.conv2.norm'],
+                    ['encoder.pan_blocks.0.conv3.conv', 'encoder.pan_blocks.0.conv3.norm'],
+                    ['encoder.pan_blocks.1.conv1.conv', 'encoder.pan_blocks.1.conv1.norm'],
+                    ['encoder.pan_blocks.1.conv2.conv', 'encoder.pan_blocks.1.conv2.norm'],
+                    ['encoder.pan_blocks.1.bottlenecks.0.conv1.conv', 'encoder.pan_blocks.1.bottlenecks.0.conv1.norm'],
+                    ['encoder.pan_blocks.1.bottlenecks.0.conv2.conv', 'encoder.pan_blocks.1.bottlenecks.0.conv2.norm'],
+                    ['encoder.pan_blocks.1.bottlenecks.1.conv1.conv', 'encoder.pan_blocks.1.bottlenecks.1.conv1.norm'],
+                    ['encoder.pan_blocks.1.bottlenecks.1.conv2.conv', 'encoder.pan_blocks.1.bottlenecks.1.conv2.norm'],
+                    ['encoder.pan_blocks.1.bottlenecks.2.conv1.conv', 'encoder.pan_blocks.1.bottlenecks.2.conv1.norm'],
+                    ['encoder.pan_blocks.1.bottlenecks.2.conv2.conv', 'encoder.pan_blocks.1.bottlenecks.2.conv2.norm'],
+                    ['encoder.pan_blocks.1.conv3.conv', 'encoder.pan_blocks.1.conv3.norm'],
+                ]
+                
+                validated_modules_to_fuse = []
+                for conv_path, bn_path in potential_fusion_candidates:
+                    try:
+                        # Use model.get_submodule() which is the correct way to get nested modules
+                        conv_mod = self.model.get_submodule(conv_path)
+                        bn_mod = self.model.get_submodule(bn_path)
+                        
+                        # Check if they are the correct types for fusion
+                        if isinstance(conv_mod, nn.Conv2d) and isinstance(bn_mod, nn.BatchNorm2d):
+                            validated_modules_to_fuse.append([conv_path, bn_path])
+                        # else:
+                        #     logging.debug(f"Skipping fusion for '{conv_path}': not a valid Conv/BN pair.")
+                    except AttributeError:
+                        # This will catch cases where a path like 'short.conv.conv' doesn't exist
+                        # because 'short' might be an nn.Identity() module. This is expected.
+                        # logging.warning(f"Could not find module at path '{conv_path}' or '{bn_path}'. Skipping.")
+                        pass # It's normal for some paths not to exist, so we just skip them silently
 
-                    if modules_to_fuse:
-                        logging.info(f"Attempting to fuse {len(modules_to_fuse)} module groups based on provided structure.")
-                        # Fuse modules in place for efficiency
-                        self.model = fuse_modules(self.model, modules_to_fuse, inplace=True)
-                        self.model.eval() # Ensure fused model is still in eval mode
-                        logging.info("Fusion attempt finished.")
-                    else:
-                        logging.info("Module list for fusion is empty, skipping.")
-
-                except ImportError:
-                     logging.warning("`torch.ao.quantization.fuse_modules` not found. Skipping layer fusion.")
-                except Exception as e:
-                     # Catch potential errors if module names are incorrect
-                     logging.error(f"Could not fuse modules: {e}. Double-check the module names in the 'modules_to_fuse' list against your model structure.")
-                     traceback.print_exc()
-                     # Decide if you want to exit or continue without fusion
-                     # sys.exit(1) # Uncomment to exit if fusion fails critically
-                     logging.warning("Continuing export without fusion due to error.")
+                if validated_modules_to_fuse:
+                    logging.info(f"Found {len(validated_modules_to_fuse)} valid module pairs to fuse.")
+                    try:
+                        self.model = fuse_modules(self.model, validated_modules_to_fuse, inplace=True)
+                        self.model.eval()
+                        logging.info("Fusion completed successfully.")
+                    except Exception as e:
+                        logging.error(f"An unexpected error occurred during fusion: {e}")
+                        traceback.print_exc()
+                        logging.warning("Continuing export without fusion.")
+                else:
+                    logging.warning("No valid modules found for fusion. Continuing without fusion.")
             else:
                 logging.info("Layer fusion skipped as per arguments.")
 
-            # Ensure model is in eval mode after potential fusion
-            self.model.eval()
             logging.info("Model and postprocessor prepared for export.")
 
         def forward(self, images, orig_target_sizes):
             outputs = self.model(images)
-            if self.postprocessor:
-                 outputs = self.postprocessor(outputs, orig_target_sizes)
-            else:
-                 logging.warning("No postprocessor found or used.")
+            outputs = self.postprocessor(outputs, orig_target_sizes)
             return outputs
 
     # Create instance of the deployment-ready model

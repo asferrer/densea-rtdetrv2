@@ -12,7 +12,7 @@ from typing import Iterable
 import torch
 import torch.amp 
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp.grad_scaler import GradScaler
 
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
