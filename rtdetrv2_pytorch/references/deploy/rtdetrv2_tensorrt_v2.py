@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 """
-TensorRT inference script for RT-DETRv2 models.
+TensorRT inference and evaluation script for RT-DETRv2 models.
 
 Features:
-- Handles image, video, folder, and camera/stream inputs automatically.
+- Handles image, video, folder, camera/stream, and evaluation modes.
 - Optimized for TensorRT engines (.engine files), especially with FP16.
 - Supports engines built with dynamic shapes (dynamic batch size).
 - Allocates necessary host (pinned) and device (GPU) memory using PyCUDA.
 - Performs asynchronous inference using CUDA streams.
 - Includes preprocessing and postprocessing steps.
-    - Preprocessing: Resizes, normalizes (0-1), transposes to CHW.
-    - Postprocessing: Filters detections by confidence threshold.
-- Minimalist bounding box drawing using OpenCV.
-- Optional real-time display (`--show`) or saving results to file (default).
-- Basic benchmarking (warm-up, latency, FPS).
+- Evaluation mode to compute mAP using a COCO-style JSON annotation file.
+  - Recursively finds images in any subdirectory.
+  - Caches image paths for high performance.
+- Saves all evaluation metrics to an output directory:
+  - Performance stats (FPS, latency, GPU usage) in JSON and TXT.
+  - mAP results per class in JSON.
+  - Confusion matrix (raw .npy and optional .png visualization).
 """
 
 import os
@@ -27,17 +29,37 @@ import pycuda.autoinit # Important: Initializes CUDA context and handles cleanup
 import time
 from tqdm import tqdm
 import colorsys
+import json
+from collections import defaultdict
+
+# --- Optional Imports for Metrics ---
+try:
+    # NOTE: The 'nvidia-ml-py' package provides the 'pynvml' module.
+    # Install with: pip install nvidia-ml-py
+    import pynvml
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
+    
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    PLOTTING_AVAILABLE = False
+
 
 # TensorRT Logger Severity
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 # Default maximum number of detections expected from the model output.
-# Used for allocating output buffers if the engine profile information is unreliable.
 MAX_OUTPUT_DETECTIONS = 300
 
 # Default input dimensions (adjust if your model differs)
 INPUT_HEIGHT = 640
 INPUT_WIDTH = 640
+
+# --- Utility Functions ---
 
 def generate_color_map(num_classes: int) -> list:
     """Generates a list of distinct BGR colors for drawing."""
@@ -59,14 +81,16 @@ def draw_detections_cv2(image, labels, boxes, scores, label_map=None, color_map=
     if not isinstance(labels, (list, np.ndarray)) or len(labels) == 0:
         return image # Return original image if no detections
     img_h, img_w = image.shape[:2]
+    # Create a dictionary from the color_map list for easier lookup
+    color_dict = {i: color for i, color in enumerate(color_map)} if color_map else {}
+
     for i, box in enumerate(boxes):
         label_id = int(labels[i])
         score = scores[i]
         x1, y1, x2, y2 = map(int, box) # Ensure coordinates are integers
-        if color_map and 0 <= label_id < len(color_map):
-            color = color_map[label_id]
-        else:
-            color = (0, 255, 0) # Default to green
+        
+        color = color_dict.get(label_id, (0, 255, 0)) # Default to green
+        
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
         class_name = label_map.get(label_id, str(label_id))
         text = f"{class_name}: {score:.2f}"
@@ -89,7 +113,7 @@ def auto_detect_mode(input_source: str) -> str:
     if not isinstance(input_source, str):
          try: int(input_source); return "camera"
          except (ValueError, TypeError): raise TypeError(f"Input must be path (str) or camera index (int), got {type(input_source)}")
-    
+
     image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
     video_exts = ['.mp4', '.avi', '.mkv', '.mov']
 
@@ -110,6 +134,8 @@ def auto_detect_mode(input_source: str) -> str:
             if input_source.startswith(("rtsp://", "http://", "https://")): return "camera"
             else: raise ValueError(f"Input source not found or not recognized: {input_source}")
 
+# --- Preprocessing and Postprocessing ---
+
 def preprocess_image(image_bgr, target_height, target_width):
     """
     Preprocesses an image (BGR NumPy array) for RT-DETR inference.
@@ -124,20 +150,16 @@ def preprocess_image(image_bgr, target_height, target_width):
     batch_sizes = np.array([[original_w, original_h]], dtype=np.int64)
     return np.ascontiguousarray(batch_images), np.ascontiguousarray(batch_sizes)
 
-def postprocess(labels, boxes, scores, original_hw, confidence_thr, input_shape=(640, 640)):
+def postprocess(labels, boxes, scores, confidence_thr):
     """
     Postprocesses the raw outputs from the RT-DETR model.
-    NOTE: Assumes 'boxes' are already absolute xyxy coordinates.
     """
     keep = scores > confidence_thr
-    num_after_filter = np.sum(keep)
-    if num_after_filter == 0: return np.array([]), np.array([]), np.array([])
-    filtered_labels = labels[keep]
-    filtered_scores = scores[keep]
-    filtered_boxes_abs = boxes[keep]
-    return filtered_labels.astype(int), filtered_boxes_abs.astype(int), filtered_scores
+    if not np.any(keep): return np.array([]), np.array([]), np.array([])
+    return labels[keep].astype(int), boxes[keep].astype(int), scores[keep]
 
 
+# --- TensorRT Core Functions ---
 def load_engine(engine_file_path):
     """Loads a TensorRT engine from file."""
     if not os.path.exists(engine_file_path): raise FileNotFoundError(f"TensorRT engine file not found: {engine_file_path}")
@@ -158,323 +180,379 @@ def allocate_buffers(engine, batch_size=1):
         shape_from_engine = engine.get_tensor_shape(binding_name)
         dtype = trt.nptype(engine.get_tensor_dtype(binding_name))
         mode = engine.get_tensor_mode(binding_name)
-        calculated_shape = None
-        if mode == trt.TensorIOMode.INPUT:
-            if -1 in shape_from_engine:
-                try:
-                    profile_shapes = engine.get_tensor_profile_shape(binding_name, 0)
-                    shape = profile_shapes[2]; shape = tuple([batch_size if dim == -1 else dim for dim in shape])
-                    calculated_shape = shape
-                    print(f"  Binding '{binding_name}' (Input, Dynamic): Using max shape -> {shape}")
-                except Exception as e: print(f"Error getting profile shape for input '{binding_name}': {e}"); raise
-            else: calculated_shape = shape_from_engine; print(f"  Binding '{binding_name}' (Input, Static): Using shape {shape_from_engine}")
-        else: # OUTPUT
-            print(f"  Binding '{binding_name}' (Output): Shape from engine: {shape_from_engine}")
-            if binding_name == "labels" or binding_name == "scores": shape = (batch_size, MAX_OUTPUT_DETECTIONS)
-            elif binding_name == "boxes": shape = (batch_size, MAX_OUTPUT_DETECTIONS, 4)
-            else: print(f"  Warning: Unknown output '{binding_name}'. Using shape from engine: {shape_from_engine}"); shape = shape_from_engine
-            if -1 in shape: shape = tuple([batch_size if dim == -1 else dim for dim in shape])
-            calculated_shape = shape; print(f"    Allocating based on assumed max detections: {calculated_shape}")
-        size = trt.volume(calculated_shape) if calculated_shape else 0
-        buffer_shape_info = calculated_shape
-        if size <= 0: print(f"  Warning: Calc size <= 0 for '{binding_name}'. Allocating min size (1)."); size = 1; buffer_shape_info = shape_from_engine
-        nbytes = size * np.dtype(dtype).itemsize
-        try: host_mem = cuda.pagelocked_empty(size, dtype=dtype); device_mem = cuda.mem_alloc(nbytes)
-        except Exception as e: print(f"Error allocating memory for {binding_name} (size {size}, {nbytes} bytes): {e}"); raise
+        
+        if -1 in shape_from_engine:
+            profile_shapes = engine.get_tensor_profile_shape(binding_name, 0)
+            shape = profile_shapes[2] # max shape
+            shape = tuple([batch_size if dim == -1 else dim for dim in shape])
+        else:
+            shape = shape_from_engine
+            
+        if mode == trt.TensorIOMode.OUTPUT:
+            if "labels" in binding_name or "scores" in binding_name: shape = (batch_size, MAX_OUTPUT_DETECTIONS)
+            elif "boxes" in binding_name: shape = (batch_size, MAX_OUTPUT_DETECTIONS, 4)
+            
+        size = trt.volume(shape)
+        host_mem = cuda.pagelocked_empty(size, dtype=dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
         bindings.append(int(device_mem))
-        buffer_info = {'host': host_mem, 'device': device_mem, 'shape': buffer_shape_info, 'dtype': dtype, 'name': binding_name, 'allocated_size': size}
+        buffer_info = {'host': host_mem, 'device': device_mem, 'shape': shape, 'name': binding_name, 'allocated_size': size}
         if mode == trt.TensorIOMode.INPUT: inputs.append(buffer_info)
         else: outputs.append(buffer_info)
-        print(f"    Allocated {nbytes / (1024*1024):.2f} MB for '{binding_name}' (size: {size})")
-    if not inputs: print("Warning: No input buffers allocated.");
-    if not outputs: print("Warning: No output buffers allocated.");
-    print("Buffer allocation complete."); return inputs, outputs, bindings, stream
+    return inputs, outputs, bindings, stream
 
 def infer_tensorrt(context, engine, inputs, outputs, stream, batch_input_image, batch_orig_size):
     """
     Performs asynchronous inference using TensorRT context and pre-allocated buffers.
-    Uses execute_async_v3.
     """
-    images_buffer = next((inp for inp in inputs if inp['name'] == "images"), None)
-    sizes_buffer = next((inp for inp in inputs if inp['name'] == "orig_target_sizes"), None)
-    if not images_buffer or not sizes_buffer: raise ValueError("Input buffers not found.")
-    try:
-        image_data_size = batch_input_image.size; size_data_size = batch_orig_size.size
-        images_buffer['host'].ravel()[:image_data_size] = batch_input_image.ravel()
-        sizes_buffer['host'].ravel()[:size_data_size] = batch_orig_size.ravel()
-    except Exception as e: print(f"Error copying to host buffers: {e}"); raise
+    images_buffer = next(inp for inp in inputs if inp['name'] == "images")
+    sizes_buffer = next(inp for inp in inputs if inp['name'] == "orig_target_sizes")
+    
+    np.copyto(images_buffer['host'], batch_input_image.ravel())
+    np.copyto(sizes_buffer['host'], batch_orig_size.ravel())
+    
     cuda.memcpy_htod_async(images_buffer['device'], images_buffer['host'], stream)
     cuda.memcpy_htod_async(sizes_buffer['device'], sizes_buffer['host'], stream)
-    if not context.set_input_shape("images", batch_input_image.shape): print(f"Error set_input_shape 'images'"); return None
-    if not context.set_input_shape("orig_target_sizes", batch_orig_size.shape): print(f"Error set_input_shape 'orig_target_sizes'"); return None
+    
+    context.set_input_shape("images", batch_input_image.shape)
+    context.set_input_shape("orig_target_sizes", batch_orig_size.shape)
+    
     for buf in inputs + outputs:
-        if not context.set_tensor_address(buf['name'], buf['device']): print(f"Error set_tensor_address '{buf['name']}'"); return None
-    if not context.execute_async_v3(stream_handle=stream.handle): print("Error execute_async_v3"); return None
-    for out in outputs: cuda.memcpy_dtoh_async(out['host'], out['device'], stream)
+        context.set_tensor_address(buf['name'], buf['device'])
+        
+    context.execute_async_v3(stream_handle=stream.handle)
+    
+    for out in outputs:
+        cuda.memcpy_dtoh_async(out['host'], out['device'], stream)
+        
     stream.synchronize()
+    
     results = {}
     for out in outputs:
-         try: output_shape = context.get_tensor_shape(out['name'])
-         except Exception: output_shape = context.get_binding_shape(engine.get_binding_index(out['name']))
-         valid_output_shape = True
-         if any(dim < 0 for dim in output_shape):
-              print(f"Warning: Invalid output shape {output_shape} for '{out['name']}'. Using alloc shape."); output_shape = out['shape']
-              if any(dim < 0 for dim in output_shape): print(f"Error: Fallback shape invalid for '{out['name']}'."); results[out['name']] = None; valid_output_shape = False
-         if valid_output_shape:
-             expected_size = trt.volume(output_shape); allocated_size = out['allocated_size']
-             if expected_size == 0 and allocated_size >= 1: print(f"Warning: Output '{out['name']}' shape {output_shape}. Flat buffer."); results[out['name']] = out['host'][:1]
-             elif allocated_size >= expected_size: results[out['name']] = out['host'][:expected_size].reshape(output_shape)
-             else: print(f"Error: Output buffer size mismatch '{out['name']}'. Alloc:{allocated_size}, Expected:{expected_size}"); results[out['name']] = None
+        output_shape = context.get_tensor_shape(out['name'])
+        expected_size = trt.volume(output_shape)
+        results[out['name']] = out['host'][:expected_size].reshape(output_shape)
     return results
 
-def main(args):
-    """Loads engine, allocates buffers, runs inference loop, handles output."""
+# --- Evaluation Functions ---
 
-    # --- Define Class Map and Colors Here ---
-    # Example class map (COCO simplified) - Replace with your actual class map
-    CLASS_MAP = {
-        0: "Bottle", 1: "Can", 2: "Fishing_Net", 3: "Glove", 4: "Mask",
-        5: "Metal_Debris", 6: "Plastic_Debris", 7: "Tire",
-    }
-    NUM_CLASSES = len(CLASS_MAP)
-    label_map = CLASS_MAP # Use this variable now defined in main scope
-    # Generate colors based on the number of classes
-    cv_color_map = generate_color_map(NUM_CLASSES) # Use this variable now defined in main scope
+def calculate_iou(boxA_xywh, boxB_xyxy):
+    """Calculates Intersection over Union (IoU) between a COCO box (xywh) and a predicted box (xyxy)."""
+    boxA_xyxy = [boxA_xywh[0], boxA_xywh[1], boxA_xywh[0] + boxA_xywh[2], boxA_xywh[1] + boxA_xywh[3]]
+    xA = max(boxA_xyxy[0], boxB_xyxy[0]); yA = max(boxA_xyxy[1], boxB_xyxy[1])
+    xB = min(boxA_xyxy[2], boxB_xyxy[2]); yB = min(boxA_xyxy[3], boxB_xyxy[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = boxA_xywh[2] * boxA_xywh[3]
+    boxBArea = (boxB_xyxy[2] - boxB_xyxy[0]) * (boxB_xyxy[3] - boxB_xyxy[1])
+    denominator = float(boxAArea + boxBArea - interArea)
+    return interArea / denominator if denominator > 0 else 0.0
 
-    # --- Setup ---
-    if not os.path.exists(args.engine_file): raise FileNotFoundError(f"TensorRT engine file not found: {args.engine_file}")
-    mode = auto_detect_mode(args.input); print(f"Detected mode: {mode}")
-    if not args.show or mode == "folder": os.makedirs(args.save_dir, exist_ok=True); print(f"Output directory: {args.save_dir}")
+def compute_ap(recall, precision):
+    """Computes Average Precision from recall and precision arrays."""
+    mrec = np.concatenate(([0.], recall, [1.])); mpre = np.concatenate(([0.], precision, [0.]))
+    for i in range(mpre.size - 1, 0, -1): mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+    i = np.where(mrec[1:] != mrec[:-1])[0]
+    return np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
 
-    # --- Load Engine & Allocate Buffers ---
-    engine = None; context = None; inputs = outputs = bindings = stream = None
+def plot_confusion_matrix(cm, class_names, output_path):
+    """Saves a graphical plot of the confusion matrix."""
+    if not PLOTTING_AVAILABLE:
+        print("Warning: Matplotlib/Seaborn not installed. Skipping confusion matrix plot.")
+        print("Install with: pip install matplotlib seaborn")
+        return
     try:
-        engine = load_engine(args.engine_file)
-        context = engine.create_execution_context()
-        if context is None: raise RuntimeError("Failed to create execution context.")
-        inputs, outputs, bindings, stream = allocate_buffers(engine, batch_size=1)
-    except Exception as e: print(f"Error during setup: {e}"); sys.exit(1) # Exit if setup fails
+        figure = plt.figure(figsize=(12, 12))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="viridis", xticklabels=class_names, yticklabels=class_names)
+        plt.ylabel("True Label")
+        plt.xlabel("Predicted Label")
+        plt.title("Confusion Matrix")
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Confusion matrix plot saved to {output_path}")
+    except Exception as e:
+        print(f"Error plotting confusion matrix: {e}")
 
-    # --- Prepare Output Name ---
-    try:
-        input_name = os.path.splitext(os.path.basename(args.input))[0] if isinstance(args.input, str) else f"camera_{args.input}"
-    except Exception: input_name = "output"
-    engine_name = os.path.splitext(os.path.basename(args.engine_file))[0]
-    output_base_name = f"{input_name}_{engine_name}"
-
-    # --- Benchmarking and Display Setup ---
-    warmup_runs = 3; inference_times = []; window_name = "TensorRT Inference"
-
-    # --- Process Image ---
-    if mode == "image":
+def run_evaluation(args, context, engine, inputs, outputs, stream):
+    """Runs the complete evaluation process and saves all metrics."""
+    global PYNVML_AVAILABLE
+    
+    print("--- Starting Evaluation Mode ---")
+    
+    # --- Initialize NVML for GPU monitoring ---
+    handle = None
+    if PYNVML_AVAILABLE:
         try:
-            frame = cv2.imread(args.input)
-            if frame is None: raise FileNotFoundError(f"Could not read image: {args.input}")
-            print(f"Image loaded: {args.input}")
-            input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-            print(f"Performing {warmup_runs} warm-up runs...")
-            for _ in range(warmup_runs): _ = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
-            print("Warm-up complete.")
-            print("Performing inference...")
-            start_time = time.perf_counter()
-            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
-            end_time = time.perf_counter(); inference_times.append(end_time - start_time)
-            if trt_outputs is None: raise RuntimeError("TensorRT inference failed.")
-            labels_out = trt_outputs.get("labels"); boxes_out = trt_outputs.get("boxes"); scores_out = trt_outputs.get("scores")
-            if labels_out is None or boxes_out is None or scores_out is None: raise ValueError("Inconsistent/missing output tensor.")
-            if labels_out.ndim > 0 and labels_out.shape[0] == 1: labels_out = labels_out[0]
-            if boxes_out.ndim > 0 and boxes_out.shape[0] == 1: boxes_out = boxes_out[0]
-            if scores_out.ndim > 0 and scores_out.shape[0] == 1: scores_out = scores_out[0]
-            original_wh = input_size_batch[0]
-            labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, original_wh, args.threshold)
-            print(f"Postprocessing complete. Final detections: {len(labels)}")
-            if len(labels) == 0 and scores_out.size > 0: max_score = np.max(scores_out) if scores_out.size > 0 else 0; print(f"NOTE: No detections above threshold {args.threshold}. Max score: {max_score:.4f}.")
-            elif len(labels) < 5 and len(labels) < len(scores_out): print(f"NOTE: Few detections ({len(labels)}). Lower --threshold (current: {args.threshold})")
-            annotated_frame = draw_detections_cv2(frame.copy(), labels, boxes, scores, label_map, cv_color_map)
-            if args.show:
-                print("Displaying result. Press 'q' to close.")
-                cv2.imshow(window_name, annotated_frame);
-                while True:
-                    if cv2.waitKey(1) & 0xFF == ord('q'): break
-            else:
-                out_filename = f"{output_base_name}.jpg"; out_path = os.path.join(args.save_dir, out_filename)
-                if cv2.imwrite(out_path, annotated_frame): print(f"Inferred image saved to: {out_path}")
-                else: print(f"Error saving image to {out_path}")
-        except Exception as e: print(f"Error processing image: {e}")
-
-    # --- Process Folder ---
-    elif mode == "folder":
-        if args.show:
-            print("Warning: --show is not supported for folder mode. Results will be saved to disk.")
-        
-        image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        try:
-            image_files = sorted([os.path.join(args.input, f) for f in os.listdir(args.input)
-                                  if os.path.splitext(f)[1].lower() in image_exts])
-            if not image_files:
-                raise FileNotFoundError(f"No images found in directory: {args.input}")
-
-            print(f"Found {len(image_files)} images in the directory.")
-            
-            # Warm-up on the first image
-            print(f"Performing {warmup_runs} warm-up runs on the first image...")
-            first_frame = cv2.imread(image_files[0])
-            if first_frame is None: raise IOError(f"Could not read first image for warm-up: {image_files[0]}")
-            input_image_batch, input_size_batch = preprocess_image(first_frame, INPUT_HEIGHT, INPUT_WIDTH)
-            for _ in range(warmup_runs): _ = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
-            print("Warm-up complete.")
-
-            # Process all images
-            for image_path in tqdm(image_files, desc="Processing folder", unit="image"):
-                frame = cv2.imread(image_path)
-                if frame is None:
-                    print(f"Warning: Could not read image {image_path}, skipping.")
-                    continue
-                
-                input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-                
-                start_time = time.perf_counter()
-                trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
-                end_time = time.perf_counter()
-                inference_times.append(end_time - start_time)
-
-                annotated_frame = frame.copy()
-                if trt_outputs:
-                    try:
-                        labels_out = trt_outputs.get("labels")
-                        boxes_out = trt_outputs.get("boxes")
-                        scores_out = trt_outputs.get("scores")
-                        if labels_out is not None and boxes_out is not None and scores_out is not None:
-                            if labels_out.ndim > 0 and labels_out.shape[0] == 1: labels_out = labels_out[0]
-                            if boxes_out.ndim > 0 and boxes_out.shape[0] == 1: boxes_out = boxes_out[0]
-                            if scores_out.ndim > 0 and scores_out.shape[0] == 1: scores_out = scores_out[0]
-                            
-                            original_wh = input_size_batch[0]
-                            labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, original_wh, args.threshold)
-                            annotated_frame = draw_detections_cv2(annotated_frame, labels, boxes, scores, label_map, cv_color_map)
-                    except Exception as e:
-                        print(f"Error post-processing/drawing on {os.path.basename(image_path)}: {e}")
-                
-                # Save the output image
-                img_basename = os.path.splitext(os.path.basename(image_path))[0]
-                out_filename = f"{img_basename}_{engine_name}.jpg"
-                out_path = os.path.join(args.save_dir, out_filename)
-                cv2.imwrite(out_path, annotated_frame)
-            
-            print(f"\nFinished processing all images. Results saved in '{args.save_dir}'.")
-
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            print("NVML initialized for GPU monitoring.")
         except Exception as e:
-            print(f"An error occurred during folder processing: {e}")
+            print(f"Warning: Could not initialize NVML. GPU monitoring disabled. Error: {e}")
+            print("To enable, please install the official package: pip install nvidia-ml-py")
+            PYNVML_AVAILABLE = False
 
-    # --- Process Video/Camera ---
-    elif mode in ["video", "camera"]:
-        cap = None; out_writer = None
-        try:
-            if mode == "video": cap = cv2.VideoCapture(args.input)
-            else: cap = cv2.VideoCapture(int(args.input)) if args.input.isdigit() else cv2.VideoCapture(args.input)
-            if not cap or not cap.isOpened(): raise IOError(f"Cannot open source: {args.input}")
-            w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); fps=cap.get(cv2.CAP_PROP_FPS)
-            if fps <= 0: fps = 30; print(f"Warning: Could not get FPS, defaulting to {fps}")
-            print(f"Source opened: {args.input} ({w}x{h} @ {fps:.2f} FPS)")
-            if not args.show:
-                out_filename = f"{output_base_name}.mp4"; out_path = os.path.join(args.save_dir, out_filename)
-                out_writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                if not out_writer.isOpened(): raise IOError(f"Cannot open VideoWriter for {out_path}")
-                print(f"Saving output video to: {out_path}")
-            else: cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-            ret, frame = cap.read();
-            if not ret: raise IOError("Cannot read first frame.")
-            print(f"Performing {warmup_runs} warm-up runs...")
-            input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-            for _ in range(warmup_runs): _ = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
-            print("Warm-up complete.")
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if mode == "video" and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 else 0
-            pbar = tqdm(total=total_frames if total_frames > 0 and not args.show else None, desc="Processing", unit="frame", disable=args.show)
-            frame_count = 0
-            while True:
-                current_frame = frame
-                input_image_batch, input_size_batch = preprocess_image(current_frame, INPUT_HEIGHT, INPUT_WIDTH)
-                start_time = time.perf_counter()
-                trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
-                end_time = time.perf_counter(); inference_times.append(end_time - start_time)
-                annotated_frame = current_frame.copy() # Default to original if inference fails
-                if trt_outputs is not None:
-                    try:
-                        labels_out = trt_outputs.get("labels"); boxes_out = trt_outputs.get("boxes"); scores_out = trt_outputs.get("scores")
-                        if labels_out is not None and boxes_out is not None and scores_out is not None:
-                            if labels_out.ndim > 0 and labels_out.shape[0] == 1: labels_out = labels_out[0]
-                            if boxes_out.ndim > 0 and boxes_out.shape[0] == 1: boxes_out = boxes_out[0]
-                            if scores_out.ndim > 0 and scores_out.shape[0] == 1: scores_out = scores_out[0]
-                            original_wh = input_size_batch[0]
-                            labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, original_wh, args.threshold)
-                            annotated_frame = draw_detections_cv2(annotated_frame, labels, boxes, scores, label_map, cv_color_map)
-                        # else: print(f"Warning: Inconsistent outputs frame {frame_count}.") # Optional warning
-                    except Exception as e: print(f"Error postprocessing/drawing frame {frame_count}: {e}")
-                # else: print(f"Warning: Inference failed frame {frame_count}.") # Optional warning
+    # --- Load and Parse Annotations ---
+    with open(args.eval_json) as f: annotations_data = json.load(f)
+    CLASS_MAP = {cat['id']: cat['name'] for cat in annotations_data['categories']}
+    images_info = {img['id']: img for img in annotations_data['images']}
+    annotations_info = defaultdict(list)
+    for ann in annotations_data['annotations']: annotations_info[ann['image_id']].append(ann)
 
-                if args.show:
-                    cv2.imshow(window_name, annotated_frame);
-                    if cv2.waitKey(1) & 0xFF == ord('q'): print("Exiting..."); break
+    # --- Cache Image Paths ---
+    print(f"Scanning for image paths in '{args.eval_root_dir}'...")
+    image_path_cache = {os.path.basename(f): os.path.join(dp, f) for dp, _, fn in os.walk(args.eval_root_dir) for f in fn}
+    print(f"Found {len(image_path_cache)} files. Starting evaluation on {len(images_info)} annotated images.")
+
+    # --- Evaluation Loop ---
+    all_predictions = defaultdict(list)
+    ground_truths = defaultdict(list)
+    inference_times, gpu_utilizations, gpu_memory_used = [], [], []
+
+    for image_id, image_details in tqdm(images_info.items(), desc="Evaluating Images"):
+        image_basename = os.path.basename(image_details['file_name'])
+        image_path = image_path_cache.get(image_basename)
+        if not image_path: continue
+        frame = cv2.imread(image_path)
+        if frame is None: continue
+        
+        input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
+        
+        start_time = time.perf_counter()
+        trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
+        inference_times.append(time.perf_counter() - start_time)
+
+        if PYNVML_AVAILABLE and handle:
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                gpu_utilizations.append(util.gpu)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpu_memory_used.append(mem.used / (1024**2)) # In MB
+            except pynvml.NVMLError as e:
+                if "Not Supported" in str(e):
+                    if handle: # Print only once
+                        print(f"\nWarning: GPU metric collection is not supported by the driver/GPU. Disabling.")
+                    handle = None # Stop trying to prevent repeated warnings
                 else:
-                    if out_writer: out_writer.write(annotated_frame); pbar.update(1)
-                frame_count += 1; ret, frame = cap.read()
-                if not ret: break
-            if not args.show: pbar.close()
-        except Exception as e: print(f"Error during video/camera processing: {e}")
-        finally:
-            if cap and cap.isOpened(): cap.release()
-            if out_writer and out_writer.isOpened(): out_writer.release()
-            if not args.show: print(f"\nVideo processing finished.")
+                    print(f"\nWarning: An NVML error occurred: {e}")
 
-    # --- Cleanup and Stats ---
+        if trt_outputs is None: continue
+        labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
+        if labels_out.ndim > 1: labels_out, boxes_out, scores_out = labels_out[0], boxes_out[0], scores_out[0]
+        
+        for label_id, box, score in zip(labels_out, boxes_out, scores_out):
+            if score >= args.threshold and label_id in CLASS_MAP:
+                all_predictions[label_id].append({'image_id': image_id, 'bbox': box, 'score': score})
+        for ann in annotations_info.get(image_id, []):
+            if ann['category_id'] in CLASS_MAP:
+                ground_truths[ann['category_id']].append({'image_id': image_id, 'bbox': ann['bbox'], 'used': False})
+    
+    # --- Calculate Metrics ---
+    print("\n--- Calculating Final Metrics ---")
+    average_precisions = {}
+    class_ids = sorted(CLASS_MAP.keys())
+    id_to_idx = {id: i for i, id in enumerate(class_ids)}
+    num_classes = len(class_ids)
+    
+    confusion_matrix = np.zeros((num_classes + 1, num_classes + 1), dtype=np.int32)
+    background_idx = num_classes
+
+    for class_id in class_ids:
+        class_idx = id_to_idx[class_id]
+        class_name = CLASS_MAP[class_id]
+        preds = sorted(all_predictions.get(class_id, []), key=lambda x: x['score'], reverse=True)
+        gts_for_class = [gt for gt in ground_truths.get(class_id, [])]
+        num_gts = len(gts_for_class)
+        
+        for gt in gts_for_class: gt['used'] = False
+
+        if num_gts == 0:
+            average_precisions[class_name] = 1.0 if not preds else 0.0
+            for _ in preds: confusion_matrix[background_idx, class_idx] += 1
+            continue
+
+        tp = np.zeros(len(preds)); fp = np.zeros(len(preds))
+        
+        for i, pred in enumerate(preds):
+            gt_matches = [gt for gt in gts_for_class if gt['image_id'] == pred['image_id'] and not gt['used']]
+            best_iou, best_gt_idx = 0, -1
+            if gt_matches:
+                ious = [calculate_iou(gt['bbox'], pred['bbox']) for gt in gt_matches]
+                best_match_local_idx = np.argmax(ious)
+                if ious[best_match_local_idx] >= args.iou_threshold:
+                    original_gt_obj = gt_matches[best_match_local_idx]
+                    best_gt_idx = next((idx for idx, gt in enumerate(gts_for_class) if gt is original_gt_obj), -1)
+
+            if best_gt_idx != -1 and not gts_for_class[best_gt_idx]['used']:
+                tp[i] = 1; gts_for_class[best_gt_idx]['used'] = True
+                confusion_matrix[class_idx, class_idx] += 1 # Correct detection
+            else:
+                fp[i] = 1; confusion_matrix[background_idx, class_idx] += 1 # FP
+
+        fn_count = len([gt for gt in gts_for_class if not gt['used']])
+        confusion_matrix[class_idx, background_idx] += fn_count
+
+        tp_cumsum, fp_cumsum = np.cumsum(tp), np.cumsum(fp)
+        recall = tp_cumsum / num_gts if num_gts > 0 else np.zeros_like(tp_cumsum)
+        precision = np.divide(tp_cumsum, (tp_cumsum + fp_cumsum), out=np.zeros_like(tp_cumsum, dtype=float), where=(tp_cumsum + fp_cumsum) != 0)
+        average_precisions[class_name] = compute_ap(recall, precision)
+
+    # --- Save Metrics ---
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    perf_stats = {
+        "total_images": len(inference_times),
+        "avg_latency_ms": np.mean(inference_times) * 1000 if inference_times else 0,
+        "std_latency_ms": np.std(inference_times) * 1000 if inference_times else 0,
+        "min_latency_ms": np.min(inference_times) * 1000 if inference_times else 0,
+        "max_latency_ms": np.max(inference_times) * 1000 if inference_times else 0,
+        "avg_fps": 1.0 / np.mean(inference_times) if inference_times else 0,
+        "avg_gpu_utilization_percent": float(np.mean(gpu_utilizations)) if gpu_utilizations else "N/A",
+        "avg_gpu_memory_used_mb": float(np.mean(gpu_memory_used)) if gpu_memory_used else "N/A"
+    }
+    
+    mean_ap = np.mean(list(average_precisions.values())) if average_precisions else 0
+    eval_metrics = {"mAP": mean_ap, "per_class_AP": average_precisions}
+
+    with open(os.path.join(args.output_dir, "evaluation_summary.txt"), 'w') as f:
+        f.write("--- Evaluation Summary ---\n")
+        f.write(f"mAP@{args.iou_threshold:.2f}: {mean_ap:.4f}\n\n")
+        f.write("--- Per-Class AP ---\n")
+        for name, ap in average_precisions.items(): f.write(f"{name:20}: {ap:.4f}\n")
+        f.write("\n--- Performance Stats ---\n")
+        # --- CORRECTED LINE ---
+        for key, val in perf_stats.items():
+            line = f"{key:30}: {val:.2f}\n" if isinstance(val, (float, np.floating)) else f"{key:30}: {val}\n"
+            f.write(line)
+        # --- END CORRECTION ---
+    print(f"Summary report saved to {os.path.join(args.output_dir, 'evaluation_summary.txt')}")
+    
+    with open(os.path.join(args.output_dir, "performance_stats.json"), 'w') as f: json.dump(perf_stats, f, indent=4)
+    with open(os.path.join(args.output_dir, "evaluation_metrics.json"), 'w') as f: json.dump(eval_metrics, f, indent=4)
+
+    cm_path_npy = os.path.join(args.output_dir, "confusion_matrix.npy")
+    np.save(cm_path_npy, confusion_matrix)
+    print(f"Confusion matrix data saved to {cm_path_npy}")
+    
+    class_names_for_plot = [CLASS_MAP[cid] for cid in class_ids] + ["Background (FN)"]
+    plot_confusion_matrix(confusion_matrix, class_names_for_plot, os.path.join(args.output_dir, "confusion_matrix.png"))
+
+    if PYNVML_AVAILABLE: pynvml.nvmlShutdown()
+
+# --- Main Execution Logic ---
+def main(args):
+    # --- Setup ---
+    engine = load_engine(args.engine_file)
+    context = engine.create_execution_context()
+    inputs, outputs, bindings, stream = allocate_buffers(engine, batch_size=1)
+    
+    # --- Mode Selection ---
+    if args.eval_json and args.eval_root_dir:
+        run_evaluation(args, context, engine, inputs, outputs, stream)
+        return 
+    
+    if not args.input:
+        print("Error: No input for inference. Use '-i' or evaluation paths."); return
+
+    # --- INFERENCE MODES ---
+    mode = auto_detect_mode(args.input)
+    os.makedirs(args.save_dir, exist_ok=True)
+    FALLBACK_CLASS_MAP = {i: f"class_{i}" for i in range(200)} # Generic fallback for inference
+    color_map = generate_color_map(len(FALLBACK_CLASS_MAP))
+    engine_name = os.path.splitext(os.path.basename(args.engine_file))[0]
+    
+    if mode == "image":
+        frame = cv2.imread(args.input)
+        if frame is None: print(f"Error reading image: {args.input}"); return
+        input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
+        trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
+        if trt_outputs:
+            labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
+            if labels_out.ndim > 1: labels_out, boxes_out, scores_out = labels_out[0], boxes_out[0], scores_out[0]
+            labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, args.threshold)
+            annotated_frame = draw_detections_cv2(frame.copy(), labels, boxes, scores, FALLBACK_CLASS_MAP, color_map)
+            if args.show:
+                cv2.imshow("Inference", annotated_frame); cv2.waitKey(0)
+            else:
+                out_path = os.path.join(args.save_dir, f"{os.path.basename(args.input)}_{engine_name}.jpg")
+                cv2.imwrite(out_path, annotated_frame); print(f"Saved to {out_path}")
+
+    elif mode == "folder":
+        if args.show: print("Warning: --show not supported for folder mode.")
+        image_files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        for image_path in tqdm(image_files, desc="Processing folder"):
+            frame = cv2.imread(image_path)
+            if frame is None: continue
+            input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
+            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
+            if trt_outputs:
+                labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
+                if labels_out.ndim > 1: labels_out, boxes_out, scores_out = labels_out[0], boxes_out[0], scores_out[0]
+                labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, args.threshold)
+                annotated_frame = draw_detections_cv2(frame.copy(), labels, boxes, scores, FALLBACK_CLASS_MAP, color_map)
+                out_path = os.path.join(args.save_dir, f"{os.path.basename(image_path)}_{engine_name}.jpg")
+                cv2.imwrite(out_path, annotated_frame)
+    
+    elif mode in ["video", "camera"]:
+        cap = cv2.VideoCapture(int(args.input) if mode == "camera" and args.input.isdigit() else args.input)
+        if not cap.isOpened(): print(f"Error opening source: {args.input}"); return
+        w, h, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
+        out_writer = None
+        if not args.show:
+            name = f"cam_{args.input}" if mode == "camera" else os.path.splitext(os.path.basename(args.input))[0]
+            out_path = os.path.join(args.save_dir, f"{name}_{engine_name}.mp4")
+            out_writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w,h))
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
+            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
+            annotated_frame = frame.copy()
+            if trt_outputs:
+                labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
+                if labels_out.ndim > 1: labels_out, boxes_out, scores_out = labels_out[0], boxes_out[0], scores_out[0]
+                labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, args.threshold)
+                annotated_frame = draw_detections_cv2(annotated_frame, labels, boxes, scores, FALLBACK_CLASS_MAP, color_map)
+            if args.show:
+                cv2.imshow("Inference", annotated_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+            elif out_writer: out_writer.write(annotated_frame)
+        cap.release(); 
+        if out_writer: out_writer.release()
+
     cv2.destroyAllWindows()
-    try:
-        # Free PyCUDA buffers first
-        if inputs:
-            for inp in inputs: inp['device'].free()
-        if outputs:
-            for out in outputs: out['device'].free()
-        # Then delete TRT objects (context before engine)
-        if 'context' in locals() and context: del context
-        if 'engine' in locals() and engine: del engine
-        print("TensorRT/PyCUDA resources released.")
-    except Exception as e: print(f"Error during resource cleanup: {e}")
-
-    # --- Display Benchmarking Stats ---
-    if inference_times:
-        valid_inference_times = inference_times # Use all recorded times
-        avg_latency_ms=np.mean(valid_inference_times)*1000; std_latency_ms=np.std(valid_inference_times)*1000
-        min_latency_ms=np.min(valid_inference_times)*1000; max_latency_ms=np.max(valid_inference_times)*1000
-        avg_fps=1.0/np.mean(valid_inference_times)
-        print("\n--- Inference Time Stats (TensorRT context.execute_async_v3) ---")
-        print(f"Frames processed: {len(valid_inference_times)}")
-        print(f"Avg Latency: {avg_latency_ms:.2f} ms"); print(f"Min Latency: {min_latency_ms:.2f} ms")
-        print(f"Max Latency: {max_latency_ms:.2f} ms"); print(f"Std Dev:     {std_latency_ms:.2f} ms")
-        print(f"Avg FPS:     {avg_fps:.2f}")
-    else: print("\nNo inference runs recorded for benchmarking.")
-
     print("Script finished.")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="TensorRT inference script for RT-DETRv2 models.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--engine_file', type=str, required=True, help="Path to the TensorRT engine file (.engine).")
-    parser.add_argument('-i', '--input', type=str, required=True,
-                        help="Path to input image, video, folder, or camera index/URL.")
-    parser.add_argument('--save_dir', type=str, default='inference_results_trt',
-                        help="Directory to save output files (if --show is not used).")
-    parser.add_argument('--threshold', type=float, default=0.5, help="Confidence threshold for detections.")
-    parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'],
-                        help="Device hint (TensorRT primarily uses GPU if engine is built for it).")
-    parser.add_argument('--show', action='store_true',
-                        help="Display inference results in real-time instead of saving to file.")
+        description="TensorRT inference and evaluation script for RT-DETRv2 models.",
+        formatter_class=argparse.RawTextHelpFormatter)
+    
+    # --- Arguments ---
+    parser.add_argument('--engine_file', type=str, required=True, help="Path to the TensorRT engine file.")
+    
+    # Inference Arguments
+    inference_group = parser.add_argument_group('Inference Arguments')
+    inference_group.add_argument('-i', '--input', type=str, help="Path to input for inference (image, video, folder, or camera index).")
+    inference_group.add_argument('--save_dir', type=str, default='inference_results', help="Directory to save inference outputs.")
+    inference_group.add_argument('--show', action='store_true', help="Display inference results in a window.")
+    
+    # Evaluation Arguments
+    eval_group = parser.add_argument_group('Evaluation Arguments')
+    eval_group.add_argument('--eval_json', type=str, help="Path to the COCO-style JSON annotation file.")
+    eval_group.add_argument('--eval_root_dir', type=str, help="Root directory of the dataset images for evaluation.")
+    eval_group.add_argument('--output_dir', type=str, default='evaluation_results', help="Directory to save all evaluation metric files.")
 
-    # Dependency check
-    try:
-        import tensorrt; import pycuda.driver; import pycuda.autoinit
-    except ImportError as e: print(f"Error: Missing dependency - {e}"); sys.exit(1)
-
+    # Common Parameters
+    param_group = parser.add_argument_group('Common Parameters')
+    param_group.add_argument('--threshold', type=float, default=0.4, help="Confidence threshold for detections.")
+    param_group.add_argument('--iou_threshold', type=float, default=0.5, help="IoU threshold for a match during evaluation (for mAP).")
+    
     args = parser.parse_args()
+    
+    if not args.eval_json and not args.input:
+        parser.error("You must specify either inference input with '-i' or evaluation paths.")
+    if args.eval_json and not args.eval_root_dir:
+        parser.error("'--eval_root_dir' is required when using '--eval_json'.")
+
     main(args)
