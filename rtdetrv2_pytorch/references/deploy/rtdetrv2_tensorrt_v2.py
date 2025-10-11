@@ -3,7 +3,7 @@
 TensorRT inference script for RT-DETRv2 models.
 
 Features:
-- Handles image, video, and camera/stream inputs automatically.
+- Handles image, video, folder, and camera/stream inputs automatically.
 - Optimized for TensorRT engines (.engine files), especially with FP16.
 - Supports engines built with dynamic shapes (dynamic batch size).
 - Allocates necessary host (pinned) and device (GPU) memory using PyCUDA.
@@ -11,7 +11,6 @@ Features:
 - Includes preprocessing and postprocessing steps.
     - Preprocessing: Resizes, normalizes (0-1), transposes to CHW.
     - Postprocessing: Filters detections by confidence threshold.
-      (NOTE: Assumes the engine outputs absolute xyxy coordinates based on previous debugging).
 - Minimalist bounding box drawing using OpenCV.
 - Optional real-time display (`--show`) or saving results to file (default).
 - Basic benchmarking (warm-up, latency, FPS).
@@ -85,18 +84,23 @@ def draw_detections_cv2(image, labels, boxes, scores, label_map=None, color_map=
 
 def auto_detect_mode(input_source: str) -> str:
     """
-    Automatically detects the input mode (image, video, camera/stream).
+    Automatically detects the input mode (image, video, folder, camera/stream).
     """
-    # ... (Function content remains the same) ...
     if not isinstance(input_source, str):
          try: int(input_source); return "camera"
          except (ValueError, TypeError): raise TypeError(f"Input must be path (str) or camera index (int), got {type(input_source)}")
-    image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']; video_exts = ['.mp4', '.avi', '.mkv', '.mov']
-    if os.path.exists(input_source):
+    
+    image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    video_exts = ['.mp4', '.avi', '.mkv', '.mov']
+
+    if os.path.isdir(input_source):
+        return "folder"
+    elif os.path.exists(input_source):
         ext = os.path.splitext(input_source)[1].lower()
         if ext in image_exts: return "image"
         elif ext in video_exts: return "video"
         else:
+            # Fallback check for video files without common extensions
             cap_test = cv2.VideoCapture(input_source)
             if cap_test.isOpened(): cap_test.release(); return "video"
             else: print(f"Warning: Unknown extension '{ext}', treating as image."); return "image"
@@ -240,7 +244,7 @@ def main(args):
     # --- Setup ---
     if not os.path.exists(args.engine_file): raise FileNotFoundError(f"TensorRT engine file not found: {args.engine_file}")
     mode = auto_detect_mode(args.input); print(f"Detected mode: {mode}")
-    if not args.show: os.makedirs(args.save_dir, exist_ok=True); print(f"Output directory: {args.save_dir}")
+    if not args.show or mode == "folder": os.makedirs(args.save_dir, exist_ok=True); print(f"Output directory: {args.save_dir}")
 
     # --- Load Engine & Allocate Buffers ---
     engine = None; context = None; inputs = outputs = bindings = stream = None
@@ -297,6 +301,70 @@ def main(args):
                 if cv2.imwrite(out_path, annotated_frame): print(f"Inferred image saved to: {out_path}")
                 else: print(f"Error saving image to {out_path}")
         except Exception as e: print(f"Error processing image: {e}")
+
+    # --- Process Folder ---
+    elif mode == "folder":
+        if args.show:
+            print("Warning: --show is not supported for folder mode. Results will be saved to disk.")
+        
+        image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+        try:
+            image_files = sorted([os.path.join(args.input, f) for f in os.listdir(args.input)
+                                  if os.path.splitext(f)[1].lower() in image_exts])
+            if not image_files:
+                raise FileNotFoundError(f"No images found in directory: {args.input}")
+
+            print(f"Found {len(image_files)} images in the directory.")
+            
+            # Warm-up on the first image
+            print(f"Performing {warmup_runs} warm-up runs on the first image...")
+            first_frame = cv2.imread(image_files[0])
+            if first_frame is None: raise IOError(f"Could not read first image for warm-up: {image_files[0]}")
+            input_image_batch, input_size_batch = preprocess_image(first_frame, INPUT_HEIGHT, INPUT_WIDTH)
+            for _ in range(warmup_runs): _ = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
+            print("Warm-up complete.")
+
+            # Process all images
+            for image_path in tqdm(image_files, desc="Processing folder", unit="image"):
+                frame = cv2.imread(image_path)
+                if frame is None:
+                    print(f"Warning: Could not read image {image_path}, skipping.")
+                    continue
+                
+                input_image_batch, input_size_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
+                
+                start_time = time.perf_counter()
+                trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, input_size_batch)
+                end_time = time.perf_counter()
+                inference_times.append(end_time - start_time)
+
+                annotated_frame = frame.copy()
+                if trt_outputs:
+                    try:
+                        labels_out = trt_outputs.get("labels")
+                        boxes_out = trt_outputs.get("boxes")
+                        scores_out = trt_outputs.get("scores")
+                        if labels_out is not None and boxes_out is not None and scores_out is not None:
+                            if labels_out.ndim > 0 and labels_out.shape[0] == 1: labels_out = labels_out[0]
+                            if boxes_out.ndim > 0 and boxes_out.shape[0] == 1: boxes_out = boxes_out[0]
+                            if scores_out.ndim > 0 and scores_out.shape[0] == 1: scores_out = scores_out[0]
+                            
+                            original_wh = input_size_batch[0]
+                            labels, boxes, scores = postprocess(labels_out, boxes_out, scores_out, original_wh, args.threshold)
+                            annotated_frame = draw_detections_cv2(annotated_frame, labels, boxes, scores, label_map, cv_color_map)
+                    except Exception as e:
+                        print(f"Error post-processing/drawing on {os.path.basename(image_path)}: {e}")
+                
+                # Save the output image
+                img_basename = os.path.splitext(os.path.basename(image_path))[0]
+                out_filename = f"{img_basename}_{engine_name}.jpg"
+                out_path = os.path.join(args.save_dir, out_filename)
+                cv2.imwrite(out_path, annotated_frame)
+            
+            print(f"\nFinished processing all images. Results saved in '{args.save_dir}'.")
+
+        except Exception as e:
+            print(f"An error occurred during folder processing: {e}")
 
     # --- Process Video/Camera ---
     elif mode in ["video", "camera"]:
@@ -394,7 +462,7 @@ if __name__ == '__main__':
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--engine_file', type=str, required=True, help="Path to the TensorRT engine file (.engine).")
     parser.add_argument('-i', '--input', type=str, required=True,
-                        help="Path to input image/video file or camera index/URL.")
+                        help="Path to input image, video, folder, or camera index/URL.")
     parser.add_argument('--save_dir', type=str, default='inference_results_trt',
                         help="Directory to save output files (if --show is not used).")
     parser.add_argument('--threshold', type=float, default=0.5, help="Confidence threshold for detections.")
