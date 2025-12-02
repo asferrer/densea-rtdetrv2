@@ -24,7 +24,7 @@ class BaseSolver(object):
         self.cfg = cfg 
 
     def _setup(self, ):
-        """Avoid instantiating unnecessary classes 
+        """Avoid instantiating unnecessary classes
         """
         cfg = self.cfg
         if cfg.device:
@@ -33,7 +33,7 @@ class BaseSolver(object):
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.model = cfg.model
-        
+
         # NOTE (lyuwenyu): must load_tuning_state before ema instance building
         if self.cfg.tuning:
             print(f'tuning checkpoint from {self.cfg.tuning}')
@@ -48,9 +48,17 @@ class BaseSolver(object):
         self.ema = to(cfg.ema, device)
         self.scaler = cfg.scaler
 
+        # Load EMA state from tuning checkpoint if available
+        if self.cfg.tuning and hasattr(self, '_tuning_ema_state') and self._tuning_ema_state is not None and self.ema is not None:
+            try:
+                self.ema.load_state_dict(self._tuning_ema_state, strict=False)
+                print(f'Load ema.state_dict from tuning checkpoint')
+            except Exception as e:
+                print(f'Warning: Could not load EMA state from tuning checkpoint: {e}')
+
         self.device = device
         self.last_epoch = self.cfg.last_epoch
-        
+
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.writer = cfg.writer
@@ -155,7 +163,7 @@ class BaseSolver(object):
             state = torch.load(path, map_location='cpu')
 
         module = dist_utils.de_parallel(self.model)
-        
+
         # TODO hard code
         if 'ema' in state:
             stat, infos = self._matched_state(module.state_dict(), state['ema']['module'])
@@ -164,6 +172,9 @@ class BaseSolver(object):
 
         module.load_state_dict(stat, strict=False)
         print(f'Load model.state_dict, {infos}')
+
+        # Store EMA state for later initialization (after EMA instance is created)
+        self._tuning_ema_state = state.get('ema', None)
 
 
     @staticmethod

@@ -19,3 +19,11 @@ ema:
   type: ModelEMA
   decay: 0.9999
   warmups: 2000
+
+early_stopping_patience: 15
+
+early_stopping_min_delta: 0.01
+
+early_stopping_metric: 'coco_eval_bbox'
+
+enable_per_class_metrics: True

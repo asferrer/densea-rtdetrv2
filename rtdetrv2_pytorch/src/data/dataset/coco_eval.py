@@ -81,6 +81,65 @@ class CocoEvaluator(object):
             print("IoU metric: {}".format(iou_type))
             coco_eval.summarize()
 
+        # Store per-class metrics for logging
+        self.per_class_metrics = self.compute_per_class_metrics('bbox')
+
+    def compute_per_class_metrics(self, iou_type='bbox'):
+        """
+        Compute per-class Average Precision and Average Recall metrics.
+
+        Args:
+            iou_type (str): Type of IoU metric ('bbox', 'segm', 'keypoints')
+
+        Returns:
+            dict: {category_id: {'AP': ap_value, 'AP50': ap50_value, 'AP75': ap75_value, 'AR': ar_value}}
+        """
+        if iou_type not in self.coco_eval:
+            return {}
+
+        coco_eval = self.coco_eval[iou_type]
+
+        # Ensure evaluate and accumulate have been called
+        if not hasattr(coco_eval, 'eval') or coco_eval.eval is None:
+            return {}
+
+        precision = coco_eval.eval['precision']  # [T, R, K, A, M]
+        # T: iou thresholds (10 values from 0.50:0.95)
+        # R: recall thresholds (101 values from 0:1)
+        # K: categories (num_classes)
+        # A: area ranges (4: all, small, medium, large)
+        # M: max detections (3: 1, 10, 100)
+
+        recall = coco_eval.eval['recall']  # [T, K, A, M]
+
+        per_class_metrics = {}
+
+        for idx, cat_id in enumerate(coco_eval.params.catIds):
+            # AP @ IoU=0.50:0.95 (average over all IoU thresholds, area=all, maxDets=100)
+            ap_all = precision[:, :, idx, 0, 2]
+            ap = ap_all[ap_all > -1].mean() if (ap_all > -1).any() else 0.0
+
+            # AP @ IoU=0.50 (first IoU threshold)
+            ap50_all = precision[0, :, idx, 0, 2]
+            ap50 = ap50_all[ap50_all > -1].mean() if (ap50_all > -1).any() else 0.0
+
+            # AP @ IoU=0.75 (6th IoU threshold: 0.50 + 5*0.05 = 0.75)
+            ap75_all = precision[5, :, idx, 0, 2]
+            ap75 = ap75_all[ap75_all > -1].mean() if (ap75_all > -1).any() else 0.0
+
+            # AR @ maxDets=100 (average over all IoU thresholds, area=all)
+            ar_all = recall[:, idx, 0, 2]
+            ar = ar_all[ar_all > -1].mean() if (ar_all > -1).any() else 0.0
+
+            per_class_metrics[cat_id] = {
+                'AP': float(ap),
+                'AP50': float(ap50),
+                'AP75': float(ap75),
+                'AR': float(ar),
+            }
+
+        return per_class_metrics
+
     def prepare(self, predictions, iou_type):
         if iou_type == "bbox":
             return self.prepare_for_coco_detection(predictions)
