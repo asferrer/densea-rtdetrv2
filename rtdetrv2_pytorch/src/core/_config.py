@@ -65,11 +65,19 @@ class BaseConfig(object):
         self.find_unused_parameters :bool = None
 
         self.seed :int = None
-        self.print_freq :int = None 
+        self.print_freq :int = None
         self.checkpoint_freq :int = 1
         self.output_dir :str = None
         self.summary_dir :str = None
         self.device : str = ''
+
+        # Early stopping configuration
+        self.early_stopping_patience: int = None
+        self.early_stopping_min_delta: float = 0.0
+        self.early_stopping_metric: str = 'coco_eval_bbox'
+
+        # Per-class metrics
+        self.enable_per_class_metrics: bool = False
 
     @property
     def model(self, ) -> nn.Module:
