@@ -100,6 +100,7 @@ rtdetrv2_r18vd(_sp4)| grid_sampling | 86,400 | 47.9 | 64.9 | [url](https://githu
 1. Training
 ```shell
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --master_port=9909 --nproc_per_node=4 tools/train.py -c path/to/config --use-amp --seed=0 &> log.txt 2>&1 &
+python tools/train.py -c /app/RT-DETR/configs/rtdetrv2/rtdetrv2_r50vd_densea_v9.yml --use-amp 2>&1 | tee train-rtdetrv2_r50vd_densea_v9.log
 ```
 
 <!-- <summary>2. Testing </summary> -->

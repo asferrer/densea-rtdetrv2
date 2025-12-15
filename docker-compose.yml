@@ -12,7 +12,7 @@ services:
     volumes:
       - ./rtdetrv2_pytorch:/app/RT-DETR # Monta el código fuente en el contenedor
     ports:
-      - "6006:6006"  # Mapea el puerto de TensorBoard
+      - "6007:6007"  # Mapea el puerto de TensorBoard
       - "8502:8502"  # Puerto para streamlit
     environment:
       - NVIDIA_VISIBLE_DEVICES=all

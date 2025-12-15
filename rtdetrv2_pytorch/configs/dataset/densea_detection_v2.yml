@@ -5,7 +5,7 @@ evaluator:
   type: CocoEvaluator
   iou_types: ['bbox', ]
 
-num_classes: 20
+num_classes: 7
 remap_mscoco_category: False
 
 
@@ -14,17 +14,36 @@ train_dataloader:
   dataset: 
     type: MultiDirCocoDetection  # Cambiado de CocoDetection a MultiDirCocoDetection
     image_dirs:
-      - ./dataset/cleansea_dataset/train/
+      - ./dataset/cleansea_dataset/CocoFormatDataset/train_coco/
       - ./dataset/Ocean_garbage/train/
       - ./dataset/Ocean_garbage/valid/
       - ./dataset/Neural_Ocean/train/
       - ./dataset/Neural_Ocean/valid/
+      - ./dataset/cleansea_dataset/CocoFormatDataset/test_coco/
+      - ./dataset/Ocean_garbage/test/
+      - ./dataset/Neural_Ocean/test/
       - ./dataset/synthetic_dataset_v2/
+    anno_path: "/app/RT-DETR/split_v7/train_with_synth_v2.json"
     return_masks: False
     remap_mscoco_category: False
     transforms:
       type: Compose
       ops:
+        - {type: RandomPhotometricDistort, p: 0.5}  # Ajustado para condiciones de fondo marino
+        - {type: RandomGaussianBlur, kernel_size: 3, sigma: [0.1, 1.5], p: 0.3}
+        - {type: RandomNoise, mean: 0, std: 0.005, p: 0.3}
+        - {type: RandomRotation, degrees: 15, p: 0.4}  # Mayor rango de rotaciones
+        - {type: RandomZoomOut, fill: 0, p: 0.3}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: RandomHorizontalFlip, p: 0.5}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 150  # Extendido para mantener data augmentation por más tiempo
+        ops: ['RandomPhotometricDistort', 'RandomGaussianBlur', 'RandomIoUCrop']
       
   shuffle: True
   num_workers: 0
@@ -38,9 +57,15 @@ val_dataloader:
   dataset: 
     type: MultiDirCocoDetection  # Cambiado de CocoDetection a MultiDirCocoDetection
     image_dirs:
-      - ./dataset/cleansea_dataset/test/
+      - ./dataset/cleansea_dataset/CocoFormatDataset/train_coco/
+      - ./dataset/Ocean_garbage/train/
+      - ./dataset/Ocean_garbage/valid/
+      - ./dataset/Neural_Ocean/train/
+      - ./dataset/Neural_Ocean/valid/
+      - ./dataset/cleansea_dataset/CocoFormatDataset/test_coco/
       - ./dataset/Ocean_garbage/test/
       - ./dataset/Neural_Ocean/test/
+    anno_path: "/app/RT-DETR/split_v7/val.json"
     return_masks: False
     remap_mscoco_category: False
     transforms:
