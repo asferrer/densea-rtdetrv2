@@ -29,6 +29,7 @@ from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
+from scipy.optimize import linear_sum_assignment
 
 # --- Importaciones para Inferencia y Evaluación ---
 
@@ -340,6 +341,86 @@ def plot_val_dataset_distribution(dataset, label_map, args):
     plt.close()
     print(f"Distribución de instancias por clase guardada en: {dist_path}")
 
+def plot_score_distributions(score_distribution, label_map, output_dir, detection_threshold=0.5):
+    """
+    Genera histogramas de distribución de scores por clase.
+    Útil para analizar si el modelo genera predicciones con scores bajos que se filtran.
+    """
+    num_classes = len(score_distribution)
+    cols = 4
+    rows = (num_classes + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(16, 4 * rows))
+    axes = axes.flatten() if num_classes > 1 else [axes]
+
+    sorted_classes = sorted(score_distribution.items())
+
+    for idx, (cat_id, scores) in enumerate(sorted_classes):
+        if idx >= len(axes):
+            break
+        ax = axes[idx]
+        cat_name = label_map.get(cat_id, str(cat_id))
+
+        if scores:
+            # Filtrar scores muy bajos para mejor visualización
+            scores_filtered = [s for s in scores if s > 0.01]
+
+            if scores_filtered:
+                ax.hist(scores_filtered, bins=50, range=(0, 1), color='steelblue', alpha=0.7, edgecolor='black', linewidth=0.5)
+                ax.axvline(x=detection_threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold={detection_threshold}')
+                ax.axvline(x=0.25, color='orange', linestyle='--', linewidth=1.5, label='Threshold=0.25')
+
+                # Estadísticas
+                above_threshold = sum(1 for s in scores if s > detection_threshold)
+                above_025 = sum(1 for s in scores if s > 0.25)
+                above_01 = sum(1 for s in scores if s > 0.1)
+                total = len(scores)
+
+                # Resaltar clases minoritarias
+                title_color = 'red' if cat_name in ['Can', 'Metal_Debris'] else 'black'
+                ax.set_title(f"{cat_name}\n>{detection_threshold}: {above_threshold} | >0.25: {above_025} | >0.1: {above_01}\nTotal: {total}",
+                            fontsize=9, color=title_color, fontweight='bold' if cat_name in ['Can', 'Metal_Debris'] else 'normal')
+            else:
+                ax.set_title(f"{cat_name}\nSin predicciones >0.01", fontsize=9)
+        else:
+            ax.set_title(f"{cat_name}\nSin predicciones", fontsize=9)
+
+        ax.set_xlabel('Score', fontsize=8)
+        ax.set_ylabel('Frecuencia', fontsize=8)
+        ax.set_xlim(0, 1)
+
+    # Ocultar ejes vacíos
+    for idx in range(len(sorted_classes), len(axes)):
+        axes[idx].axis('off')
+
+    plt.suptitle(f'Distribución de Scores por Clase (Threshold de evaluación: {detection_threshold})', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "score_distributions.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Generar reporte de texto
+    report = "Distribución de Scores por Clase\n" + "=" * 70 + "\n"
+    report += f"{'Clase':<20} {'Total':>10} {'>0.5':>10} {'>0.25':>10} {'>0.1':>10} {'Media':>10}\n"
+    report += "-" * 70 + "\n"
+
+    for cat_id, scores in sorted_classes:
+        cat_name = label_map.get(cat_id, str(cat_id))
+        if scores:
+            above_05 = sum(1 for s in scores if s > 0.5)
+            above_025 = sum(1 for s in scores if s > 0.25)
+            above_01 = sum(1 for s in scores if s > 0.1)
+            mean_score = np.mean(scores)
+            report += f"{cat_name:<20} {len(scores):>10} {above_05:>10} {above_025:>10} {above_01:>10} {mean_score:>10.4f}\n"
+        else:
+            report += f"{cat_name:<20} {'0':>10} {'0':>10} {'0':>10} {'0':>10} {'N/A':>10}\n"
+
+    report_path = os.path.join(output_dir, "score_distribution_report.txt")
+    with open(report_path, 'w') as f:
+        f.write(report)
+
+    print(f"Distribución de scores guardada en: {output_dir}/score_distributions.png")
+    print(f"Reporte de scores guardado en: {report_path}")
+
 def iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -351,15 +432,99 @@ def iou(boxA, boxB):
     denominator = float(boxAArea + boxBArea - interArea)
     return interArea / denominator if denominator > 0 else 0.0
 
-def match_detections_in_image(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, iou_thresh=0.5):
+def match_detections_hungarian(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, iou_thresh=0.5):
     """
-    Empareja detecciones con ground truth basándose en IoU.
+    Empareja detecciones con ground truth usando el Hungarian Algorithm (optimal assignment).
 
-    Retorna:
+    Este método garantiza el matching óptimo global maximizando la suma total de IoU.
+    Es el método estándar usado en DETR y detectores modernos end-to-end.
+
+    Args:
+        gt_boxes: Lista de bounding boxes GT [x1, y1, x2, y2]
+        gt_labels: Lista de etiquetas GT
+        pred_boxes: Lista de bounding boxes predichas [x1, y1, x2, y2]
+        pred_labels: Lista de etiquetas predichas
+        pred_scores: Lista de scores de confianza (no se usa en Hungarian, pero se mantiene por compatibilidad)
+        iou_thresh: Umbral mínimo de IoU para considerar un match válido
+
+    Returns:
         matched_pairs: Lista de tuplas (gt_label, pred_label) para detecciones emparejadas
         unmatched_gts: Lista de etiquetas GT sin emparejar (falsos negativos)
         unmatched_preds: Lista de etiquetas predichas sin emparejar (falsos positivos)
     """
+    if len(pred_boxes) == 0:
+        unmatched_gts = list(gt_labels)
+        return [], unmatched_gts, []
+
+    if len(gt_boxes) == 0:
+        unmatched_preds = list(pred_labels)
+        return [], [], unmatched_preds
+
+    # 1. Construir matriz de IoU (pred_boxes x gt_boxes)
+    num_preds = len(pred_boxes)
+    num_gts = len(gt_boxes)
+    iou_matrix = np.zeros((num_preds, num_gts))
+
+    for i, pred_box in enumerate(pred_boxes):
+        for j, gt_box in enumerate(gt_boxes):
+            iou_matrix[i, j] = iou(pred_box, gt_box)
+
+    # 2. Convertir a matriz de costos (Hungarian minimiza, así que usamos -IoU)
+    cost_matrix = -iou_matrix
+
+    # 3. Aplicar Hungarian Algorithm para encontrar el matching óptimo
+    pred_indices, gt_indices = linear_sum_assignment(cost_matrix)
+
+    # 4. Filtrar matches que no superen el threshold de IoU
+    matched_pairs = []
+    matched_pred_indices = set()
+    matched_gt_indices = set()
+
+    for pred_idx, gt_idx in zip(pred_indices, gt_indices):
+        if iou_matrix[pred_idx, gt_idx] >= iou_thresh:
+            matched_pairs.append((gt_labels[gt_idx], pred_labels[pred_idx]))
+            matched_pred_indices.add(pred_idx)
+            matched_gt_indices.add(gt_idx)
+
+    # 5. Identificar predicciones y GT sin emparejar
+    unmatched_preds = [pred_labels[i] for i in range(num_preds) if i not in matched_pred_indices]
+    unmatched_gts = [gt_labels[j] for j in range(num_gts) if j not in matched_gt_indices]
+
+    return matched_pairs, unmatched_gts, unmatched_preds
+
+
+def match_detections_greedy(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, iou_thresh=0.5):
+    """
+    Empareja detecciones con ground truth usando un algoritmo Greedy basado en scores.
+
+    Este método ordena las predicciones por score (mayor a menor) y asigna cada una al
+    mejor GT disponible. Es más rápido que Hungarian pero puede producir matchings subóptimos.
+
+    Útil si quieres que la evaluación refleje un comportamiento más "realista" donde las
+    predicciones con mayor confianza tienen prioridad.
+
+    Args:
+        gt_boxes: Lista de bounding boxes GT [x1, y1, x2, y2]
+        gt_labels: Lista de etiquetas GT
+        pred_boxes: Lista de bounding boxes predichas [x1, y1, x2, y2]
+        pred_labels: Lista de etiquetas predichas
+        pred_scores: Lista de scores de confianza (SE USA para ordenar)
+        iou_thresh: Umbral mínimo de IoU para considerar un match válido
+
+    Returns:
+        matched_pairs: Lista de tuplas (gt_label, pred_label) para detecciones emparejadas
+        unmatched_gts: Lista de etiquetas GT sin emparejar (falsos negativos)
+        unmatched_preds: Lista de etiquetas predichas sin emparejar (falsos positivos)
+    """
+    if len(pred_boxes) == 0:
+        unmatched_gts = list(gt_labels)
+        return [], unmatched_gts, []
+
+    if len(gt_boxes) == 0:
+        unmatched_preds = list(pred_labels)
+        return [], [], unmatched_preds
+
+    # Ordenar predicciones por score (mayor a menor)
     preds = sorted(zip(pred_boxes, pred_labels, pred_scores), key=lambda x: x[2], reverse=True)
     matched_pairs = []
     unmatched_preds = []
@@ -368,6 +533,8 @@ def match_detections_in_image(gt_boxes, gt_labels, pred_boxes, pred_labels, pred
     for p_box, p_label, p_score in preds:
         best_iou = -1
         best_gt_idx = -1
+
+        # Buscar el mejor GT disponible para esta predicción
         for idx, (gt_box, gt_label) in enumerate(zip(gt_boxes, gt_labels)):
             if idx in assigned_gt:
                 continue
@@ -376,19 +543,32 @@ def match_detections_in_image(gt_boxes, gt_labels, pred_boxes, pred_labels, pred
                 best_iou = current_iou
                 best_gt_idx = idx
 
-        # Si encontramos un match por IoU (sin importar la clase)
+        # Si encontramos un match por IoU
         if best_iou >= iou_thresh and best_gt_idx != -1:
             assigned_gt.add(best_gt_idx)
-            # Guardamos SIEMPRE el par (gt_label, pred_label) aunque no coincidan
-            # Esto permite que la matriz de confusión muestre errores de clasificación
+            # Guardamos (gt_label, pred_label) aunque no coincidan (para confusion matrix)
             matched_pairs.append((gt_labels[best_gt_idx], p_label))
         else:
-            # Predicción sin match de IoU suficiente = Falso Positivo
             unmatched_preds.append(p_label)
 
     # Ground truth sin emparejar = Falsos Negativos
     unmatched_gts = [gt_labels[i] for i in range(len(gt_labels)) if i not in assigned_gt]
     return matched_pairs, unmatched_gts, unmatched_preds
+
+
+def match_detections_in_image(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, iou_thresh=0.5, method='hungarian'):
+    """
+    Wrapper que llama al método de matching apropiado.
+
+    Args:
+        method: 'hungarian' (óptimo) o 'greedy' (basado en scores)
+    """
+    if method == 'hungarian':
+        return match_detections_hungarian(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, iou_thresh)
+    elif method == 'greedy':
+        return match_detections_greedy(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, iou_thresh)
+    else:
+        raise ValueError(f"Método de matching desconocido: {method}. Use 'hungarian' o 'greedy'.")
 
 def evaluate_on_dataset(args, cfg, device):
     if args.onnx:
@@ -405,6 +585,19 @@ def evaluate_on_dataset(args, cfg, device):
     color_map = generate_color_map_from_label_map(label_map)
     os.makedirs(args.base_eval_dir, exist_ok=True)
 
+    # Informar configuración de evaluación
+    print("\n" + "=" * 70)
+    print("CONFIGURACIÓN DE EVALUACIÓN")
+    print("=" * 70)
+    print(f"  Método de matching:       {args.matching_method.upper()}")
+    print(f"  IoU threshold:            {args.iou_threshold}")
+    print(f"  Detection threshold:      {args.detection_threshold}")
+    if args.matching_method == 'hungarian':
+        print("  Nota: Hungarian matching es el estándar para detectores DETR/end-to-end")
+    else:
+        print("  Nota: Greedy matching prioriza detecciones con mayor confianza")
+    print("=" * 70 + "\n")
+
     # Generar distribución del dataset
     plot_val_dataset_distribution(dataset, label_map, args)
 
@@ -419,6 +612,9 @@ def evaluate_on_dataset(args, cfg, device):
     total_fp = 0
     total_gt = 0
     total_pred = 0
+
+    # Distribución de scores por clase (para análisis de umbral)
+    score_distribution = {cat_id: [] for cat_id in label_map.keys()}
 
     for batch in tqdm(dataloader, desc="Evaluando batches"):
         images, targets = batch
@@ -469,6 +665,12 @@ def evaluate_on_dataset(args, cfg, device):
             # Contar ground truth
             total_gt += len(gt_labels)
 
+            # Recolectar distribución de scores por clase (ANTES del filtrado)
+            for j in range(len(raw_pred_labels)):
+                pred_class = raw_pred_labels[j].item() + label_offset
+                if pred_class in score_distribution:
+                    score_distribution[pred_class].append(pred_scores[j].item())
+
             if args.coco_eval and COCO_TOOLS_AVAILABLE:
                 for j in range(len(raw_pred_labels)):
                     if pred_scores[j] > 0.001:
@@ -490,7 +692,8 @@ def evaluate_on_dataset(args, cfg, device):
             total_pred += len(filtered_pred_labels)
 
             matched, unmatched_gts, unmatched_preds = match_detections_in_image(
-                gt_boxes, gt_labels, filtered_pred_boxes, filtered_pred_labels, filtered_pred_scores, args.iou_threshold)
+                gt_boxes, gt_labels, filtered_pred_boxes, filtered_pred_labels, filtered_pred_scores,
+                args.iou_threshold, method=args.matching_method)
 
             # Actualizar contadores de diagnóstico
             total_matched += len(matched)
@@ -502,10 +705,8 @@ def evaluate_on_dataset(args, cfg, device):
                 all_y_pred.append(pred_lab)
             for gt_lab in unmatched_gts:
                 fn_counter[gt_lab] += 1
-                all_y_true.append(gt_lab); all_y_pred.append(-1)
             for pred_lab in unmatched_preds:
                 fp_counter[pred_lab] += 1
-                all_y_true.append(-1); all_y_pred.append(pred_lab)
 
             # Modo debug: generar imágenes comparativas si hay diferencias entre predicción y ground truth
             if args.debug:
@@ -575,6 +776,10 @@ def evaluate_on_dataset(args, cfg, device):
     else:
         print("No hay suficientes mediciones para reportar latencia.")
 
+    # --- Distribución de Scores por Clase ---
+    print("\n--- Generando distribución de scores por clase ---")
+    plot_score_distributions(score_distribution, label_map, args.base_eval_dir, args.detection_threshold)
+
     print("\n--- Métricas de Clasificación (basado en IoU) ---")
 
     if label_map and any(label_map):
@@ -584,15 +789,12 @@ def evaluate_on_dataset(args, cfg, device):
         # Crear nombres consistentes para target_names
         target_names = []
         for l in labels_to_report:
-            if l == -1:
-                target_names.append('No Detection')
-            else:
-                target_names.append(label_map.get(l, f"Clase_{l}"))
+            target_names.append(label_map.get(l, f"Clase_{l}"))
 
         try:
             report = classification_report(all_y_true, all_y_pred, labels=labels_to_report,
                                            target_names=target_names,
-                                           zero_division=0)
+                                           zero_division=0, digits=4)
             print(report)
 
             # Guardar el reporte de clasificación como imagen PNG
@@ -693,6 +895,232 @@ def evaluate_on_dataset(args, cfg, device):
             sys.stdout = original_stdout
             print(f"Reporte de evaluación COCO guardado en: {report_path}")
 
+            # --- AP por Clase (COCO) ---
+            print("\n--- AP por Clase (COCO) ---")
+            precisions = coco_eval.eval['precision']
+            # precision tiene forma: [TxRxKxAxM]
+            # T: IoU thresholds, R: recall thresholds, K: categories, A: areas, M: maxDets
+
+            cat_ids = dataset.coco.getCatIds()
+            cat_names_list = [dataset.coco.loadCats(cat_id)[0]['name'] for cat_id in cat_ids]
+
+            per_class_ap = {}
+            per_class_ap50 = {}
+            per_class_ap75 = {}
+            per_class_report = "AP por Clase (COCO Metrics)\n" + "=" * 60 + "\n"
+            per_class_report += f"{'Clase':<20} {'AP@0.5:0.95':>12} {'AP@0.50':>12} {'AP@0.75':>12}\n"
+            per_class_report += "-" * 60 + "\n"
+
+            for idx, cat_id in enumerate(cat_ids):
+                cat_name = cat_names_list[idx]
+
+                # AP@0.50:0.95 (promedio sobre todos los IoU thresholds)
+                precision_all = precisions[:, :, idx, 0, -1]
+                precision_all = precision_all[precision_all > -1]
+                ap = np.mean(precision_all) if precision_all.size else 0.0
+                per_class_ap[cat_name] = ap
+
+                # AP@0.50 (IoU threshold index 0)
+                precision_50 = precisions[0, :, idx, 0, -1]
+                precision_50 = precision_50[precision_50 > -1]
+                ap50 = np.mean(precision_50) if precision_50.size else 0.0
+                per_class_ap50[cat_name] = ap50
+
+                # AP@0.75 (IoU threshold index 5)
+                precision_75 = precisions[5, :, idx, 0, -1]
+                precision_75 = precision_75[precision_75 > -1]
+                ap75 = np.mean(precision_75) if precision_75.size else 0.0
+                per_class_ap75[cat_name] = ap75
+
+                per_class_report += f"{cat_name:<20} {ap:>12.4f} {ap50:>12.4f} {ap75:>12.4f}\n"
+
+            print(per_class_report)
+
+            # Guardar reporte por clase
+            per_class_path = os.path.join(args.base_eval_dir, "per_class_ap_report.txt")
+            with open(per_class_path, 'w') as f:
+                f.write(per_class_report)
+            print(f"Reporte AP por clase guardado en: {per_class_path}")
+
+            # Gráfica de AP por clase
+            plt.figure(figsize=(14, 6))
+            x = np.arange(len(cat_names_list))
+            width = 0.25
+
+            # Colores: rojo para Can y Metal_Debris, azul para el resto
+            colors_ap = ['#d62728' if name in ['Can', 'Metal_Debris'] else '#1f77b4' for name in cat_names_list]
+
+            bars1 = plt.bar(x - width, [per_class_ap[n] for n in cat_names_list], width, label='AP@0.5:0.95', color=colors_ap, alpha=0.9)
+            bars2 = plt.bar(x, [per_class_ap50[n] for n in cat_names_list], width, label='AP@0.50', color='#2ca02c', alpha=0.7)
+            bars3 = plt.bar(x + width, [per_class_ap75[n] for n in cat_names_list], width, label='AP@0.75', color='#ff7f0e', alpha=0.7)
+
+            plt.xticks(x, cat_names_list, rotation=45, ha='right')
+            plt.ylabel('Average Precision (AP)')
+            plt.title('AP por Clase (COCO Metrics)')
+            plt.axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
+            plt.legend(loc='upper right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.base_eval_dir, "per_class_ap.png"), dpi=150)
+            plt.close()
+            print(f"Gráfica AP por clase guardada en: {args.base_eval_dir}/per_class_ap.png")
+
+    # --- RESUMEN DIAGNÓSTICO ---
+    print("\n" + "=" * 70)
+    print("RESUMEN DIAGNÓSTICO")
+    print("=" * 70)
+
+    # Estadísticas globales
+    print(f"\n{'ESTADÍSTICAS GLOBALES':^70}")
+    print("-" * 70)
+    print(f"  Total Ground Truth:       {total_gt:>8}")
+    print(f"  Total Predicciones:       {total_pred:>8}")
+    print(f"  Total Emparejados:        {total_matched:>8}")
+    print(f"  Falsos Negativos (FN):    {total_fn:>8}  ({100*total_fn/max(total_gt,1):.1f}% de GT)")
+    print(f"  Falsos Positivos (FP):    {total_fp:>8}  ({100*total_fp/max(total_pred,1):.1f}% de pred)")
+
+    # Calcular recall y precision globales
+    global_recall = total_matched / max(total_gt, 1)
+    global_precision = total_matched / max(total_pred, 1)
+    print(f"\n  Recall Global:            {global_recall:>8.2%}")
+    print(f"  Precision Global:         {global_precision:>8.2%}")
+
+    # Análisis por clase (especialmente las minoritarias)
+    print(f"\n{'ANÁLISIS POR CLASE (Métricas de Detección)':^90}")
+    print("-" * 90)
+    print(f"{'Clase':<20} {'GT':>6} {'TP':>6} {'FN':>6} {'FP':>6} {'Recall':>8} {'Precision':>10} {'F1':>8} {'Estado':>12}")
+    print("-" * 90)
+
+    # Calcular TP por clase desde all_y_true y all_y_pred (matched pairs)
+    class_tp_count = Counter()
+    for yt, yp in zip(all_y_true, all_y_pred):
+        if yt == yp:  # Match correcto (mismo label)
+            class_tp_count[yt] += 1
+
+    # IMPORTANTE: Para cada clase calculamos:
+    # - TP: Detecciones correctas (matched con label correcto)
+    # - FN: Ground truth sin detectar
+    # - FP: Predicciones incorrectas (matched con label incorrecto + sin match)
+    # - Total GT = TP + FN (no solo los matched!)
+    # - Total Pred = TP + FP
+    # - Recall = TP / (TP + FN) = TP / Total_GT
+    # - Precision = TP / (TP + FP) = TP / Total_Pred
+    # - F1 = 2 * (Precision * Recall) / (Precision + Recall)
+
+    minority_classes = ['Can', 'Metal_Debris']
+    for cat_id in sorted(label_map.keys()):
+        cat_name = label_map[cat_id]
+
+        # Contadores
+        tp = class_tp_count.get(cat_id, 0)
+        fn = fn_counter.get(cat_id, 0)
+        fp = fp_counter.get(cat_id, 0)
+
+        # CORRECCIÓN: Total GT incluye tanto TP como FN
+        total_gt = tp + fn
+        total_pred = tp + fp
+
+        # Métricas
+        recall = tp / max(total_gt, 1)
+        precision = tp / max(total_pred, 1)
+        f1 = 2 * (precision * recall) / max(precision + recall, 1e-10)
+
+        # Determinar estado basado en F1-score
+        if f1 < 0.3:
+            estado = "⚠️  CRÍTICO"
+        elif f1 < 0.5:
+            estado = "⚠️  BAJO"
+        elif f1 < 0.7:
+            estado = "MODERADO"
+        else:
+            estado = "✓ BUENO"
+
+        # Resaltar clases minoritarias
+        prefix = ">> " if cat_name in minority_classes else "   "
+        print(f"{prefix}{cat_name:<17} {total_gt:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f} {estado:>12}")
+
+    print("-" * 70)
+
+    # Recomendaciones basadas en el análisis
+    print(f"\n{'RECOMENDACIONES':^70}")
+    print("-" * 70)
+
+    # Identificar clases problemáticas
+    problematic_classes = []
+    for cat_id in sorted(label_map.keys()):
+        cat_name = label_map[cat_id]
+        tp = class_tp_count.get(cat_id, 0)
+        fn = fn_counter.get(cat_id, 0)
+        total_gt = tp + fn
+        recall = tp / max(total_gt, 1)
+        if recall < 0.5 and total_gt > 10:  # Solo si hay suficientes muestras
+            problematic_classes.append((cat_name, recall, total_gt))
+
+    if problematic_classes:
+        print("\n  Clases con bajo recall (< 50%):")
+        for name, recall, gt in sorted(problematic_classes, key=lambda x: x[1]):
+            print(f"    - {name}: {recall:.1%} recall ({gt} GT)")
+        print("\n  Acciones sugeridas:")
+        print("    1. Aumentar class_weights en la función de pérdida para estas clases")
+        print("    2. Usar ClassBalancedSampler para sobremuestrear imágenes con estas clases")
+        print("    3. Aplicar augmentaciones específicas (class-aware augmentations)")
+        print("    4. Considerar reducir detection_threshold para estas clases específicas")
+    else:
+        print("\n  ✓ Todas las clases tienen recall >= 50%")
+
+    # Análisis de distribución de scores para clases problemáticas
+    print(f"\n{'ANÁLISIS DE SCORES (Clases Minoritarias)':^70}")
+    print("-" * 70)
+    for cat_name in minority_classes:
+        cat_id = next((k for k, v in label_map.items() if v == cat_name), None)
+        if cat_id is not None and cat_id in score_distribution:
+            scores = score_distribution[cat_id]
+            if scores:
+                above_05 = sum(1 for s in scores if s > 0.5)
+                above_025 = sum(1 for s in scores if s > 0.25)
+                above_01 = sum(1 for s in scores if s > 0.1)
+                total = len(scores)
+                print(f"\n  {cat_name}:")
+                print(f"    Total predicciones (antes de filtrar): {total}")
+                print(f"    Scores > 0.5: {above_05} ({100*above_05/max(total,1):.1f}%)")
+                print(f"    Scores > 0.25: {above_025} ({100*above_025/max(total,1):.1f}%)")
+                print(f"    Scores > 0.1: {above_01} ({100*above_01/max(total,1):.1f}%)")
+                if total > 0:
+                    print(f"    Score medio: {np.mean(scores):.3f}, mediana: {np.median(scores):.3f}")
+
+    print("\n" + "=" * 70)
+
+    # Guardar resumen diagnóstico en archivo
+    diag_report_path = os.path.join(args.base_eval_dir, "diagnostic_summary.txt")
+    with open(diag_report_path, 'w', encoding='utf-8') as f:
+        f.write("RESUMEN DIAGNÓSTICO\n")
+        f.write("=" * 70 + "\n\n")
+        f.write("ESTADÍSTICAS GLOBALES\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Total Ground Truth:       {total_gt}\n")
+        f.write(f"Total Predicciones:       {total_pred}\n")
+        f.write(f"Total Emparejados:        {total_matched}\n")
+        f.write(f"Falsos Negativos (FN):    {total_fn} ({100*total_fn/max(total_gt,1):.1f}% de GT)\n")
+        f.write(f"Falsos Positivos (FP):    {total_fp} ({100*total_fp/max(total_pred,1):.1f}% de pred)\n")
+        f.write(f"Recall Global:            {global_recall:.2%}\n")
+        f.write(f"Precision Global:         {global_precision:.2%}\n\n")
+
+        f.write("POR CLASE (Métricas Corregidas)\n")
+        f.write("-" * 90 + "\n")
+        f.write(f"{'Clase':<20} {'GT':>6} {'TP':>6} {'FN':>6} {'FP':>6} {'Recall':>8} {'Precision':>10} {'F1':>8}\n")
+        for cat_id in sorted(label_map.keys()):
+            cat_name = label_map[cat_id]
+            tp = class_tp_count.get(cat_id, 0)
+            fn = fn_counter.get(cat_id, 0)
+            fp = fp_counter.get(cat_id, 0)
+            total_gt = tp + fn
+            total_pred = tp + fp
+            recall = tp / max(total_gt, 1)
+            precision = tp / max(total_pred, 1)
+            f1 = 2 * (precision * recall) / max(precision + recall, 1e-10)
+            f.write(f"{cat_name:<20} {total_gt:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f}\n")
+
+    print(f"Resumen diagnóstico guardado en: {diag_report_path}")
+
 def main():
     parser = argparse.ArgumentParser(description="Script de evaluación unificado para RT-DETR-V2.")
     parser.add_argument('-c', '--config', required=True, help="Ruta al archivo de configuración YAML.")
@@ -705,6 +1133,8 @@ def main():
     parser.add_argument('-d', '--device', type=str, default='cuda', help="Dispositivo (cpu o cuda).")
     parser.add_argument('-dt', '--detection_threshold', type=float, default=0.5, help="Umbral de confianza para detecciones.")
     parser.add_argument('-iout', '--iou_threshold', type=float, default=0.5, help="Umbral de IoU para emparejamiento.")
+    parser.add_argument('--matching_method', type=str, default='hungarian', choices=['hungarian', 'greedy'],
+                        help="Método de matching: 'hungarian' (óptimo, estándar DETR) o 'greedy' (más rápido, basado en scores).")
     parser.add_argument('--output_dir', type=str, default='eval_results', help="Directorio base para guardar resultados.")
     parser.add_argument('--coco_eval', action='store_true', help="Activar evaluación de mAP con pycocotools.")
     parser.add_argument('--draw', action='store_true', help="Guardar imágenes con detecciones dibujadas.")
