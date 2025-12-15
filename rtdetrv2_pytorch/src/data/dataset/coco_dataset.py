@@ -190,7 +190,7 @@ mscoco_label2category = {v: k for k, v in mscoco_category2label.items()}
 
 @register()
 class MultiDirCocoDetection(CocoDetection):
-    def __init__(self, image_dirs=None, ann_file=None, transforms=None, **kwargs):
+    def __init__(self, image_dirs=None, ann_file=None, transforms=None, max_size=2048, **kwargs):
         # Para mantener la compatibilidad, aceptamos ambos nombres de argumento
         if 'anno_path' in kwargs:
             ann_file = kwargs.pop('anno_path')
@@ -202,6 +202,7 @@ class MultiDirCocoDetection(CocoDetection):
 
         super().__init__(img_folder="", ann_file=ann_file, transforms=transforms, **kwargs)
         self.image_dirs = image_dirs if isinstance(image_dirs, list) else [image_dirs]
+        self.max_size = max_size  # Limitar resolución máxima para optimizar memoria
 
     def load_item(self, idx):
         coco = self.coco
@@ -214,6 +215,14 @@ class MultiDirCocoDetection(CocoDetection):
             raise FileNotFoundError(f"No se encontró la imagen '{path}' en los directorios {self.image_dirs}")
 
         image = Image.open(found_path).convert("RGB")
+
+        # Limitar resolución máxima preservando aspect ratio (optimización para 4K images)
+        w, h = image.size
+        if max(w, h) > self.max_size:
+            scale = self.max_size / max(w, h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            image = image.resize((new_w, new_h), Image.BILINEAR)
+
         target = {'image_id': img_id, 'annotations': target_anno}
 
         image, target = self.prepare(image, target, remap=self.remap_mscoco_category, category2label=self.mscoco_category2label)
