@@ -25,14 +25,15 @@ class RTDETRCriterionv2(nn.Module):
     __inject__ = ['matcher', ]
 
     def __init__(self, \
-        matcher, 
-        weight_dict, 
-        losses, 
-        alpha=0.2, 
-        gamma=2.0, 
-        num_classes=80, 
+        matcher,
+        weight_dict,
+        losses,
+        alpha=0.2,
+        gamma=2.0,
+        num_classes=80,
         boxes_weight_format=None,
-        share_matched_indices=False):
+        share_matched_indices=False,
+        class_weights=None):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -41,16 +42,26 @@ class RTDETRCriterionv2(nn.Module):
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             boxes_weight_format: format for boxes weight (iou, )
+            class_weights: optional list/tensor of weights per class for classification loss.
+                           Higher weights increase the importance of that class in the loss.
+                           Example: [1.0, 3.0, 1.0, ...] to upweight class 1 (Can).
         """
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.losses = losses 
+        self.losses = losses
         self.boxes_weight_format = boxes_weight_format
         self.share_matched_indices = share_matched_indices
         self.alpha = alpha
         self.gamma = gamma
+
+        # Class weights for handling class imbalance
+        if class_weights is not None:
+            self.register_buffer('class_weights', torch.tensor(class_weights, dtype=torch.float32))
+            print(f"[RTDETRCriterionv2] Class weights habilitados: {class_weights}")
+        else:
+            self.class_weights = None
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -62,6 +73,12 @@ class RTDETRCriterionv2(nn.Module):
         target_classes[idx] = target_classes_o
         target = F.one_hot(target_classes, num_classes=self.num_classes+1)[..., :-1]
         loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction='none')
+
+        # Aplicar class_weights si están definidos
+        if self.class_weights is not None:
+            cw = self.class_weights.to(loss.device)
+            loss = loss * cw.unsqueeze(0).unsqueeze(0)
+
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
 
         return {'loss_focal': loss}
@@ -90,7 +107,15 @@ class RTDETRCriterionv2(nn.Module):
 
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
-        
+
+        # Aplicar class_weights si están definidos
+        # Esto aumenta la importancia de clases minoritarias en la pérdida
+        if self.class_weights is not None:
+            # class_weights tiene forma [num_classes], necesitamos expandirlo a [batch, queries, num_classes]
+            cw = self.class_weights.to(weight.device)
+            # Multiplicar el weight por los class_weights para cada clase
+            weight = weight * cw.unsqueeze(0).unsqueeze(0)
+
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_vfl': loss}
