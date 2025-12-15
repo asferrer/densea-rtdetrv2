@@ -1,13 +1,16 @@
 
-train_dataloader: 
+train_dataloader:
   collate_fn:
     type: BatchImageCollateFuncion
     scales: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
     stop_epoch: 71 # epoch in [71, ~) stop `multiscales`
 
   shuffle: True
-  total_batch_size: 16 # total batch size equals to 16 (4 * 4)
-  num_workers: 4
+  total_batch_size: 48 # Optimizado para RTX 5090 (32GB VRAM)
+  num_workers: 6 # Reducido de 8 para evitar picos CPU (Intel Core Ultra 9 285K)
+  persistent_workers: True # Evita fork overhead y picos de potencia
+  prefetch_factor: 3 # Con 96GB RAM podemos prefetch más batches
+  pin_memory: True # Acelera transferencia CPU->GPU
 
 
 val_dataloader:
