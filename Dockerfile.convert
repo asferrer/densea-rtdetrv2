@@ -1,0 +1,29 @@
+# Dockerfile dedicado para conversión ONNX → TFLite
+# Separado del Dockerfile de entrenamiento (PyTorch) para evitar conflictos
+#
+# Uso:
+#   docker build -f Dockerfile.convert -t rtdetr-convert .
+#   docker run --rm -v $(pwd):/work rtdetr-convert \
+#     python3 tools/convert_rtdetr.py \
+#       --onnx-path /work/rtdetrv2_pytorch/rtdetrv2_densea_raw.onnx \
+#       --output-dir /work/converted_models \
+#       --quantize fp16 --validate --verbose
+
+FROM docker.io/pinto0309/onnx2tf:latest
+
+# La imagen base (pinto0309/onnx2tf) ya incluye:
+#   onnx==1.20.1, onnxruntime==1.24.1, tensorflow==2.19.0,
+#   tf-keras==2.19.0, ai-edge-litert==2.1.2, onnx2tf (latest)
+
+# Instalar dependencias adicionales del script
+# --break-system-packages needed for Ubuntu 24.04 (PEP 668)
+# Pillow needed for INT8 calibration (representative dataset loading)
+RUN pip install --no-cache-dir --break-system-packages \
+    onnx-simplifier \
+    packaging \
+    Pillow
+
+WORKDIR /work
+
+ENTRYPOINT ["python3"]
+CMD ["tools/convert_rtdetr.py", "--help"]
