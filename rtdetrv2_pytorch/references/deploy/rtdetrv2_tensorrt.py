@@ -405,7 +405,8 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
         input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
 
         start_time = time.perf_counter()
-        trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[0], frame.shape[1]]]))
+        # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+        trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
         inference_times.append(time.perf_counter() - start_time)
 
         if PYNVML_AVAILABLE and handle:
@@ -642,7 +643,8 @@ def main(args):
         frame = cv2.imread(args.input)
         if frame is None: print(f"Error reading image: {args.input}"); return
         input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-        trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[0], frame.shape[1]]]))
+        # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+        trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
         if trt_outputs:
             labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
             if labels_out.ndim > 1: labels_out, boxes_out, scores_out = labels_out[0], boxes_out[0], scores_out[0]
@@ -660,7 +662,8 @@ def main(args):
             frame = cv2.imread(image_path)
             if frame is None: continue
             input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[0], frame.shape[1]]]))
+            # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
             if trt_outputs:
                 labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
                 if labels_out.ndim > 1: labels_out, boxes_out, scores_out = labels_out[0], boxes_out[0], scores_out[0]
@@ -682,7 +685,8 @@ def main(args):
             ret, frame = cap.read()
             if not ret: break
             input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[0], frame.shape[1]]]))
+            # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+            trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
             annotated_frame = frame.copy()
             if trt_outputs:
                 labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
