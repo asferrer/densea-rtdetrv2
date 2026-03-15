@@ -234,7 +234,8 @@ def main(args):
     batch_size = 1
     input_shape = (batch_size, 3, args.input_height, args.input_width)
     dummy_images = torch.randn(input_shape, dtype=torch.float32)
-    dummy_orig_sizes = torch.tensor([[args.input_height, args.input_width]] * batch_size, dtype=torch.int64)
+    # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+    dummy_orig_sizes = torch.tensor([[args.input_width, args.input_height]] * batch_size, dtype=torch.int64)
     logging.info(f"Dummy input shape (images): {dummy_images.shape}")
     logging.info(f"Dummy input (orig_target_sizes): {dummy_orig_sizes.shape}, dtype={dummy_orig_sizes.dtype}")
 

@@ -53,12 +53,14 @@ underrep_augmentation_pipeline = A.Compose([
     A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
     # RandomGaussianBlur
     A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 1.5), p=0.3),
-    # RandomNoise
-    A.GaussNoise(var_limit=(0.00002, 0.00003), mean=0, p=0.3),
+    # RandomNoise - Updated for Albumentations 1.4+
+    # std_range replaces var_limit; std ~= sqrt(var), so sqrt(0.00002) ~ 0.0045
+    A.GaussNoise(std_range=(0.004, 0.006), p=0.3),
     # RandomRotation
     A.Rotate(limit=15, p=0.4),
-    # RandomZoomOut se simula con ShiftScaleRotate con escala negativa
-    A.ShiftScaleRotate(shift_limit=0, scale_limit=(-0.2, 0), rotate_limit=0, p=0.3),
+    # RandomZoomOut - Use Affine instead of deprecated ShiftScaleRotate
+    # scale=(0.8, 1.0) gives 0-20% zoom out effect
+    A.Affine(scale=(0.8, 1.0), p=0.3),
     # RandomIoUCrop: se utiliza RandomSizedBBoxSafeCrop
     A.RandomSizedBBoxSafeCrop(height=640, width=640, erosion_rate=0.0, p=0.8),
     # RandomHorizontalFlip

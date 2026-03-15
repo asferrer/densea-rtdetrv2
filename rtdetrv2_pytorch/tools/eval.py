@@ -26,10 +26,15 @@ from tqdm import tqdm
 import colorsys
 import json
 from sklearn.metrics import confusion_matrix, classification_report
-import matplotlib.pyplot as plt
-import seaborn as sns
 from collections import Counter
 from scipy.optimize import linear_sum_assignment
+
+# Configurar matplotlib para usar backend no-interactivo ANTES de importar pyplot
+# Esto evita errores de Tkinter en entornos headless o threads secundarios
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --- Importaciones para Inferencia y Evaluación ---
 
@@ -203,6 +208,37 @@ def compute_label_offset(pred_labels_tensor: torch.Tensor, label_map: dict) -> i
         return min_label_in_map - raw_pred_min
     return 0
 
+def detect_minority_classes(class_gt_total: dict, label_map: dict, threshold_ratio: float = 0.5) -> list:
+    """
+    Detecta dinámicamente las clases minoritarias basándose en la distribución real del dataset.
+
+    Args:
+        class_gt_total: Diccionario {cat_id: count} con el total de GT por clase
+        label_map: Diccionario {cat_id: cat_name} para mapear IDs a nombres
+        threshold_ratio: Ratio respecto a la media. Clases con count < mean * ratio son minoritarias.
+                        Default 0.5 significa clases con menos del 50% de la media.
+
+    Returns:
+        Lista de nombres de clases minoritarias (vacía si no hay ninguna)
+    """
+    if not class_gt_total:
+        return []
+
+    counts = list(class_gt_total.values())
+    if not counts:
+        return []
+
+    mean_count = sum(counts) / len(counts)
+    threshold = mean_count * threshold_ratio
+
+    minority_classes = []
+    for cat_id, count in class_gt_total.items():
+        if count < threshold and count > 0:  # Solo si tiene al menos 1 instancia
+            cat_name = label_map.get(cat_id, f"ID:{cat_id}")
+            minority_classes.append(cat_name)
+
+    return minority_classes
+
 def draw_inferences(image: Image.Image, labels: torch.Tensor, boxes: torch.Tensor, scores: torch.Tensor,
                      label_map=None, color_map=None, threshold: float = 0.5,
                      label_offset: int = 0, save_path: str = None, radius: int = 2):
@@ -341,11 +377,18 @@ def plot_val_dataset_distribution(dataset, label_map, args):
     plt.close()
     print(f"Distribución de instancias por clase guardada en: {dist_path}")
 
-def plot_score_distributions(score_distribution, label_map, output_dir, detection_threshold=0.5):
+def plot_score_distributions(score_distribution, label_map, output_dir, detection_threshold=0.5, minority_classes=None):
     """
     Genera histogramas de distribución de scores por clase.
     Útil para analizar si el modelo genera predicciones con scores bajos que se filtran.
+
+    Args:
+        minority_classes: Lista de nombres de clases minoritarias (detectadas dinámicamente).
+                         Si es None o vacía, no se resalta ninguna clase.
     """
+    if minority_classes is None:
+        minority_classes = []
+
     num_classes = len(score_distribution)
     cols = 4
     rows = (num_classes + cols - 1) // cols
@@ -360,6 +403,7 @@ def plot_score_distributions(score_distribution, label_map, output_dir, detectio
             break
         ax = axes[idx]
         cat_name = label_map.get(cat_id, str(cat_id))
+        is_minority = cat_name in minority_classes
 
         if scores:
             # Filtrar scores muy bajos para mejor visualización
@@ -376,10 +420,10 @@ def plot_score_distributions(score_distribution, label_map, output_dir, detectio
                 above_01 = sum(1 for s in scores if s > 0.1)
                 total = len(scores)
 
-                # Resaltar clases minoritarias
-                title_color = 'red' if cat_name in ['Can', 'Metal_Debris'] else 'black'
+                # Resaltar clases minoritarias (solo si hay alguna detectada)
+                title_color = 'red' if is_minority else 'black'
                 ax.set_title(f"{cat_name}\n>{detection_threshold}: {above_threshold} | >0.25: {above_025} | >0.1: {above_01}\nTotal: {total}",
-                            fontsize=9, color=title_color, fontweight='bold' if cat_name in ['Can', 'Metal_Debris'] else 'normal')
+                            fontsize=9, color=title_color, fontweight='bold' if is_minority else 'normal')
             else:
                 ax.set_title(f"{cat_name}\nSin predicciones >0.01", fontsize=9)
         else:
@@ -448,7 +492,7 @@ def match_detections_hungarian(gt_boxes, gt_labels, pred_boxes, pred_labels, pre
         iou_thresh: Umbral mínimo de IoU para considerar un match válido
 
     Returns:
-        matched_pairs: Lista de tuplas (gt_label, pred_label) para detecciones emparejadas
+        matched_pairs: Lista de tuplas (gt_label, pred_label, iou_value) para detecciones emparejadas
         unmatched_gts: Lista de etiquetas GT sin emparejar (falsos negativos)
         unmatched_preds: Lista de etiquetas predichas sin emparejar (falsos positivos)
     """
@@ -482,7 +526,8 @@ def match_detections_hungarian(gt_boxes, gt_labels, pred_boxes, pred_labels, pre
 
     for pred_idx, gt_idx in zip(pred_indices, gt_indices):
         if iou_matrix[pred_idx, gt_idx] >= iou_thresh:
-            matched_pairs.append((gt_labels[gt_idx], pred_labels[pred_idx]))
+            # Ahora incluimos el IoU del match
+            matched_pairs.append((gt_labels[gt_idx], pred_labels[pred_idx], iou_matrix[pred_idx, gt_idx]))
             matched_pred_indices.add(pred_idx)
             matched_gt_indices.add(gt_idx)
 
@@ -512,7 +557,7 @@ def match_detections_greedy(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_s
         iou_thresh: Umbral mínimo de IoU para considerar un match válido
 
     Returns:
-        matched_pairs: Lista de tuplas (gt_label, pred_label) para detecciones emparejadas
+        matched_pairs: Lista de tuplas (gt_label, pred_label, iou_value) para detecciones emparejadas
         unmatched_gts: Lista de etiquetas GT sin emparejar (falsos negativos)
         unmatched_preds: Lista de etiquetas predichas sin emparejar (falsos positivos)
     """
@@ -546,8 +591,8 @@ def match_detections_greedy(gt_boxes, gt_labels, pred_boxes, pred_labels, pred_s
         # Si encontramos un match por IoU
         if best_iou >= iou_thresh and best_gt_idx != -1:
             assigned_gt.add(best_gt_idx)
-            # Guardamos (gt_label, pred_label) aunque no coincidan (para confusion matrix)
-            matched_pairs.append((gt_labels[best_gt_idx], p_label))
+            # Guardamos (gt_label, pred_label, iou) aunque no coincidan (para confusion matrix)
+            matched_pairs.append((gt_labels[best_gt_idx], p_label, best_iou))
         else:
             unmatched_preds.append(p_label)
 
@@ -602,9 +647,17 @@ def evaluate_on_dataset(args, cfg, device):
     plot_val_dataset_distribution(dataset, label_map, args)
 
     all_y_true, all_y_pred = [], []
-    fp_counter, fn_counter = Counter(), Counter()
     coco_predictions = []
     latencies = []
+
+    # Contadores por clase para métricas correctas
+    # TP: GT emparejado con predicción de la MISMA clase
+    # FP: Predicción sin emparejar O emparejada con GT de clase DIFERENTE
+    # FN: GT sin emparejar O emparejado con predicción de clase DIFERENTE
+    class_tp = Counter()  # True Positives por clase
+    class_fp = Counter()  # False Positives por clase
+    class_fn = Counter()  # False Negatives por clase
+    class_gt_total = Counter()  # Total GT por clase
 
     # Contadores de diagnóstico
     total_matched = 0
@@ -612,6 +665,12 @@ def evaluate_on_dataset(args, cfg, device):
     total_fp = 0
     total_gt = 0
     total_pred = 0
+
+    # Métricas adicionales de localización y errores
+    all_match_ious = []  # IoU de todos los matches (para Mean IoU)
+    correct_class_matches = 0  # Matches con clase correcta (localización + clasificación)
+    wrong_class_matches = 0  # Matches con clase incorrecta (localización OK, clasificación FAIL)
+    background_fps = 0  # Predicciones sin ningún match (detecciones fantasma)
 
     # Distribución de scores por clase (para análisis de umbral)
     score_distribution = {cat_id: [] for cat_id in label_map.keys()}
@@ -634,23 +693,30 @@ def evaluate_on_dataset(args, cfg, device):
             gt_boxes_tensor = target.get('boxes', torch.empty(0, 4))
             gt_labels_tensor = target.get('labels', torch.empty(0, dtype=torch.int64))
 
-            # IMPORTANTE: Las cajas GT vienen en las coordenadas del tensor redimensionado (640x640),
-            # pero necesitamos escalarlas de vuelta al tamaño original para compararlas con las predicciones
-            # que el modelo devuelve en coordenadas originales
-            orig_size = target.get('orig_size', torch.tensor([images[i].shape[1], images[i].shape[2]]))
-            current_h, current_w = images[i].shape[1], images[i].shape[2]
-            orig_h, orig_w = orig_size[0].item(), orig_size[1].item()
+            # IMPORTANTE: Las cajas GT vienen del dataloader en formato CXCYWH NORMALIZADO
+            # (después de la transformación ConvertBoxes con fmt='cxcywh', normalize=True)
+            # Necesitamos convertirlas a XYXY en coordenadas de la imagen original
+            # para compararlas con las predicciones del postprocessor.
+            # NOTA: orig_size es [W, H] según la convención del postprocessor (ver box_revert.py)
+            orig_size = target.get('orig_size', torch.tensor([images[i].shape[2], images[i].shape[1]]))  # Default: [W, H]
+            orig_w, orig_h = orig_size[0].item(), orig_size[1].item()  # orig_size es [W, H]
 
-            # Escalar las cajas GT de vuelta al tamaño original
+            # Convertir cajas GT de CXCYWH normalizado a XYXY en píxeles originales
             if len(gt_boxes_tensor) > 0:
-                scale_h = orig_h / current_h
-                scale_w = orig_w / current_w
-                gt_boxes_tensor_scaled = gt_boxes_tensor.clone()
-                gt_boxes_tensor_scaled[:, 0] *= scale_w  # x1
-                gt_boxes_tensor_scaled[:, 1] *= scale_h  # y1
-                gt_boxes_tensor_scaled[:, 2] *= scale_w  # x2
-                gt_boxes_tensor_scaled[:, 3] *= scale_h  # y2
-                gt_boxes = gt_boxes_tensor_scaled.tolist()
+                # gt_boxes_tensor está en formato [cx, cy, w, h] normalizado (0-1)
+                cx = gt_boxes_tensor[:, 0]
+                cy = gt_boxes_tensor[:, 1]
+                w = gt_boxes_tensor[:, 2]
+                h = gt_boxes_tensor[:, 3]
+
+                # Convertir a XYXY en coordenadas de la imagen original
+                x1 = (cx - w / 2) * orig_w
+                y1 = (cy - h / 2) * orig_h
+                x2 = (cx + w / 2) * orig_w
+                y2 = (cy + h / 2) * orig_h
+
+                gt_boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=1)
+                gt_boxes = gt_boxes_xyxy.tolist()
             else:
                 gt_boxes = []
 
@@ -700,13 +766,35 @@ def evaluate_on_dataset(args, cfg, device):
             total_fn += len(unmatched_gts)
             total_fp += len(unmatched_preds)
 
-            for gt_lab, pred_lab in matched:
+            # Contar GT total por clase
+            for gt_lab in gt_labels:
+                class_gt_total[gt_lab] += 1
+
+            # Procesar matches (ahora incluyen IoU)
+            for match_tuple in matched:
+                gt_lab, pred_lab, match_iou = match_tuple
                 all_y_true.append(gt_lab)
                 all_y_pred.append(pred_lab)
+                all_match_ious.append(match_iou)
+
+                if gt_lab == pred_lab:
+                    # Match correcto: TP para esa clase
+                    class_tp[gt_lab] += 1
+                    correct_class_matches += 1
+                else:
+                    # Match incorrecto: FN para GT, FP para predicción
+                    class_fn[gt_lab] += 1
+                    class_fp[pred_lab] += 1
+                    wrong_class_matches += 1
+
+            # GT sin emparejar = FN
             for gt_lab in unmatched_gts:
-                fn_counter[gt_lab] += 1
+                class_fn[gt_lab] += 1
+
+            # Predicciones sin emparejar = FP (detecciones fantasma/background)
             for pred_lab in unmatched_preds:
-                fp_counter[pred_lab] += 1
+                class_fp[pred_lab] += 1
+                background_fps += 1
 
             # Modo debug: generar imágenes comparativas si hay diferencias entre predicción y ground truth
             if args.debug:
@@ -719,7 +807,13 @@ def evaluate_on_dataset(args, cfg, device):
 
                     # Si la ruta no existe, buscar el archivo por nombre en los directorios del dataset
                     if not os.path.exists(img_path):
-                        img_dirs = dataset.image_dirs if isinstance(dataset.image_dirs, list) else [dataset.image_dirs]
+                        # Soportar tanto CocoDetection (img_folder) como MultiDirCocoDetection (image_dirs)
+                        if hasattr(dataset, 'image_dirs'):
+                            img_dirs = dataset.image_dirs if isinstance(dataset.image_dirs, list) else [dataset.image_dirs]
+                        elif hasattr(dataset, 'img_folder'):
+                            img_dirs = [dataset.img_folder]
+                        else:
+                            img_dirs = []
                         img_basename = os.path.basename(img_path)
                         found = False
                         for img_dir in img_dirs:
@@ -749,7 +843,13 @@ def evaluate_on_dataset(args, cfg, device):
 
                 # Si la ruta no existe, buscar el archivo por nombre en los directorios del dataset
                 if not os.path.exists(img_path):
-                    img_dirs = dataset.image_dirs if isinstance(dataset.image_dirs, list) else [dataset.image_dirs]
+                    # Soportar tanto CocoDetection (img_folder) como MultiDirCocoDetection (image_dirs)
+                    if hasattr(dataset, 'image_dirs'):
+                        img_dirs = dataset.image_dirs if isinstance(dataset.image_dirs, list) else [dataset.image_dirs]
+                    elif hasattr(dataset, 'img_folder'):
+                        img_dirs = [dataset.img_folder]
+                    else:
+                        img_dirs = []
                     img_basename = os.path.basename(img_path)
                     found = False
                     for img_dir in img_dirs:
@@ -776,9 +876,14 @@ def evaluate_on_dataset(args, cfg, device):
     else:
         print("No hay suficientes mediciones para reportar latencia.")
 
+    # --- Detectar clases minoritarias dinámicamente ---
+    minority_classes = detect_minority_classes(class_gt_total, label_map, threshold_ratio=0.5)
+    if minority_classes:
+        print(f"\n--- Clases minoritarias detectadas (< 50% de la media): {', '.join(minority_classes)} ---")
+
     # --- Distribución de Scores por Clase ---
     print("\n--- Generando distribución de scores por clase ---")
-    plot_score_distributions(score_distribution, label_map, args.base_eval_dir, args.detection_threshold)
+    plot_score_distributions(score_distribution, label_map, args.base_eval_dir, args.detection_threshold, minority_classes)
 
     print("\n--- Métricas de Clasificación (basado en IoU) ---")
 
@@ -795,13 +900,18 @@ def evaluate_on_dataset(args, cfg, device):
             report = classification_report(all_y_true, all_y_pred, labels=labels_to_report,
                                            target_names=target_names,
                                            zero_division=0, digits=4)
+            print("\n" + "=" * 70)
+            print("NOTA: Este reporte de sklearn SOLO considera detecciones emparejadas.")
+            print("NO incluye objetos no detectados (FN) ni detecciones fantasma (FP).")
+            print("Para métricas completas de detección, ver 'ANÁLISIS POR CLASE' más abajo.")
+            print("=" * 70)
             print(report)
 
             # Guardar el reporte de clasificación como imagen PNG
             plt.figure(figsize=(10, 8))
             plt.text(0.01, 0.05, report, {'fontsize': 10}, fontproperties='monospace')
             plt.axis('off')
-            plt.title("Reporte de Clasificación (Detecciones emparejadas)")
+            plt.title("Reporte de Clasificación (Solo detecciones emparejadas por IoU)\nNOTA: NO incluye objetos no detectados")
             report_path = os.path.join(args.base_eval_dir, "classification_report.png")
             plt.tight_layout()
             plt.savefig(report_path)
@@ -810,6 +920,89 @@ def evaluate_on_dataset(args, cfg, device):
         except Exception as e:
             print(f"No se pudo generar el reporte de clasificación: {e}")
 
+        # =====================================================================
+        # REPORTE DE DETECCIÓN COMPLETO (incluye objetos no detectados)
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print("REPORTE DE DETECCIÓN COMPLETO")
+        print("(Incluye objetos no detectados y detecciones fantasma)")
+        print("=" * 70)
+
+        # Construir reporte completo por clase
+        complete_report = "\n{:<20} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}\n".format(
+            "Clase", "Support", "TP", "FP", "FN", "Precision", "Recall", "F1-Score")
+        complete_report += "-" * 94 + "\n"
+
+        all_supports = []
+        all_precisions_complete = []
+        all_recalls_complete = []
+        all_f1s_complete = []
+
+        for cat_id in sorted(label_map.keys()):
+            cat_name = label_map[cat_id]
+            tp = class_tp.get(cat_id, 0)
+            fp = class_fp.get(cat_id, 0)
+            fn = class_fn.get(cat_id, 0)
+            support = class_gt_total.get(cat_id, 0)  # Total GT de esta clase
+
+            # Calcular métricas usando las fórmulas correctas
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 2 * (precision * recall) / max(precision + recall, 1e-10)
+
+            complete_report += "{:<20} {:>8} {:>8} {:>8} {:>8} {:>10.4f} {:>10.4f} {:>10.4f}\n".format(
+                cat_name, support, tp, fp, fn, precision, recall, f1)
+
+            all_supports.append(support)
+            all_precisions_complete.append(precision)
+            all_recalls_complete.append(recall)
+            all_f1s_complete.append(f1)
+
+        complete_report += "-" * 94 + "\n"
+
+        # Calcular promedios
+        total_support = sum(all_supports)
+
+        # Macro average (igual peso por clase)
+        macro_prec = np.mean(all_precisions_complete)
+        macro_rec = np.mean(all_recalls_complete)
+        macro_f1_val = np.mean(all_f1s_complete)
+
+        # Weighted average (ponderado por support)
+        if total_support > 0:
+            weighted_prec = sum(p * s for p, s in zip(all_precisions_complete, all_supports)) / total_support
+            weighted_rec = sum(r * s for r, s in zip(all_recalls_complete, all_supports)) / total_support
+            weighted_f1_val = sum(f * s for f, s in zip(all_f1s_complete, all_supports)) / total_support
+        else:
+            weighted_prec = weighted_rec = weighted_f1_val = 0.0
+
+        complete_report += "\n{:<20} {:>8} {:>8} {:>8} {:>8} {:>10.4f} {:>10.4f} {:>10.4f}\n".format(
+            "macro avg", "", "", "", "", macro_prec, macro_rec, macro_f1_val)
+        complete_report += "{:<20} {:>8} {:>8} {:>8} {:>8} {:>10.4f} {:>10.4f} {:>10.4f}\n".format(
+            "weighted avg", total_support, sum(class_tp.values()), sum(class_fp.values()),
+            sum(class_fn.values()), weighted_prec, weighted_rec, weighted_f1_val)
+
+        print(complete_report)
+
+        # Guardar reporte completo
+        complete_report_path = os.path.join(args.base_eval_dir, "complete_detection_report.txt")
+        with open(complete_report_path, 'w', encoding='utf-8') as f:
+            f.write("REPORTE DE DETECCIÓN COMPLETO\n")
+            f.write("(Incluye objetos no detectados y detecciones fantasma)\n")
+            f.write("=" * 94 + "\n")
+            f.write("\nFórmulas utilizadas:\n")
+            f.write("  - Precision = TP / (TP + FP)\n")
+            f.write("  - Recall = TP / (TP + FN)\n")
+            f.write("  - F1 = 2 * (Precision * Recall) / (Precision + Recall)\n")
+            f.write("\nDonde:\n")
+            f.write("  - TP: Detección correcta (IoU >= threshold Y clase correcta)\n")
+            f.write("  - FP: Detección incorrecta (sin GT match) O clase incorrecta\n")
+            f.write("  - FN: Objeto no detectado O detectado con clase incorrecta\n")
+            f.write("  - Support: Total de objetos GT de esa clase\n")
+            f.write("=" * 94 + "\n")
+            f.write(complete_report)
+        print(f"Reporte de detección completo guardado en: {complete_report_path}")
+
         # Generar matriz de confusión con nombres correctos
         cm = confusion_matrix(all_y_true, all_y_pred, labels=labels_to_report)
 
@@ -817,6 +1010,7 @@ def evaluate_on_dataset(args, cfg, device):
         num_classes = len(labels_to_report)
         fig_size = max(10, num_classes * 0.8)
 
+        # Matriz de confusión con valores absolutos
         plt.figure(figsize=(fig_size, fig_size))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                     xticklabels=target_names,
@@ -824,7 +1018,7 @@ def evaluate_on_dataset(args, cfg, device):
                     cbar_kws={'label': 'Cantidad'})
         plt.xlabel("Predicción", fontsize=12)
         plt.ylabel("Real (Ground Truth)", fontsize=12)
-        plt.title("Matriz de Confusión", fontsize=14, fontweight='bold')
+        plt.title("Matriz de Confusión (Valores Absolutos)\n[Solo detecciones emparejadas por IoU]", fontsize=14, fontweight='bold')
         plt.xticks(rotation=45, ha='right')
         plt.yticks(rotation=0)
         cm_path = os.path.join(args.base_eval_dir, 'confusion_matrix.png')
@@ -833,16 +1027,37 @@ def evaluate_on_dataset(args, cfg, device):
         plt.close()
         print(f"Matriz de confusión guardada en: {cm_path}")
 
+        # Matriz de confusión NORMALIZADA (por fila = por clase GT)
+        # Importante para datasets desbalanceados: muestra proporciones en lugar de absolutos
+        cm_normalized = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-10)
+
+        plt.figure(figsize=(fig_size, fig_size))
+        sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues',
+                    xticklabels=target_names,
+                    yticklabels=target_names,
+                    cbar_kws={'label': 'Proporción'},
+                    vmin=0, vmax=1)
+        plt.xlabel("Predicción", fontsize=12)
+        plt.ylabel("Real (Ground Truth)", fontsize=12)
+        plt.title("Matriz de Confusión Normalizada (por fila)\n[Muestra tasa de clasificación correcta por clase]", fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        cm_norm_path = os.path.join(args.base_eval_dir, 'confusion_matrix_normalized.png')
+        plt.tight_layout()
+        plt.savefig(cm_norm_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Matriz de confusión normalizada guardada en: {cm_norm_path}")
+
         # Generar reporte y gráfica de Falsos Positivos y Falsos Negativos
         print("\n--- Generando reporte de Falsos Positivos y Falsos Negativos ---")
-        fp_fn_report = "Reporte de Falsos Positivos y Falsos Negativos (No Detecciones)\n"
+        fp_fn_report = "Reporte de Falsos Positivos y Falsos Negativos\n"
         fp_fn_report += "=" * 70 + "\n"
         fp_fn_report += f"{'Categoría':<30} {'Falsos Positivos':>15} {'Falsos Negativos':>15}\n"
         fp_fn_report += "-" * 70 + "\n"
         for cat_id in sorted(label_map.keys()):
             cat_name = label_map[cat_id]
-            fp = fp_counter.get(cat_id, 0)
-            fn = fn_counter.get(cat_id, 0)
+            fp = class_fp.get(cat_id, 0)
+            fn = class_fn.get(cat_id, 0)
             fp_fn_report += f"{cat_name} ({cat_id}){'':<20} {fp:>15} {fn:>15}\n"
 
         fp_fn_report_path = os.path.join(args.base_eval_dir, "fp_fn_report.txt")
@@ -852,8 +1067,8 @@ def evaluate_on_dataset(args, cfg, device):
 
         # Graficar los contadores de FP y FN por clase
         classes = [label_map[k] for k in sorted(label_map.keys())]
-        fp_counts = [fp_counter.get(k, 0) for k in sorted(label_map.keys())]
-        fn_counts = [fn_counter.get(k, 0) for k in sorted(label_map.keys())]
+        fp_counts = [class_fp.get(k, 0) for k in sorted(label_map.keys())]
+        fn_counts = [class_fn.get(k, 0) for k in sorted(label_map.keys())]
 
         x = np.arange(len(classes))
         width = 0.35
@@ -947,8 +1162,8 @@ def evaluate_on_dataset(args, cfg, device):
             x = np.arange(len(cat_names_list))
             width = 0.25
 
-            # Colores: rojo para Can y Metal_Debris, azul para el resto
-            colors_ap = ['#d62728' if name in ['Can', 'Metal_Debris'] else '#1f77b4' for name in cat_names_list]
+            # Colores: rojo para clases minoritarias (detectadas dinámicamente), azul para el resto
+            colors_ap = ['#d62728' if name in minority_classes else '#1f77b4' for name in cat_names_list]
 
             bars1 = plt.bar(x - width, [per_class_ap[n] for n in cat_names_list], width, label='AP@0.5:0.95', color=colors_ap, alpha=0.9)
             bars2 = plt.bar(x, [per_class_ap50[n] for n in cat_names_list], width, label='AP@0.50', color='#2ca02c', alpha=0.7)
@@ -964,79 +1179,270 @@ def evaluate_on_dataset(args, cfg, device):
             plt.close()
             print(f"Gráfica AP por clase guardada en: {args.base_eval_dir}/per_class_ap.png")
 
+            # --- AP por Tamaño de Objeto (COCO) ---
+            # Importante para entender si el modelo falla con objetos pequeños
+            print("\n--- AP por Tamaño de Objeto (COCO) ---")
+            # coco_eval.stats contiene: [AP, AP50, AP75, AP_small, AP_medium, AP_large, AR1, AR10, AR100, AR_small, AR_medium, AR_large]
+            stats = coco_eval.stats
+            size_report = "AP y AR por Tamaño de Objeto\n" + "=" * 60 + "\n"
+            size_report += f"{'Métrica':<30} {'Valor':>12}\n"
+            size_report += "-" * 60 + "\n"
+            size_report += f"{'AP (IoU=0.50:0.95)':<30} {stats[0]:>12.4f}\n"
+            size_report += f"{'AP (IoU=0.50)':<30} {stats[1]:>12.4f}\n"
+            size_report += f"{'AP (IoU=0.75)':<30} {stats[2]:>12.4f}\n"
+            size_report += f"{'AP (small: area < 32²)':<30} {stats[3]:>12.4f}\n"
+            size_report += f"{'AP (medium: 32² < area < 96²)':<30} {stats[4]:>12.4f}\n"
+            size_report += f"{'AP (large: area > 96²)':<30} {stats[5]:>12.4f}\n"
+            size_report += "-" * 60 + "\n"
+            size_report += f"{'AR (maxDets=1)':<30} {stats[6]:>12.4f}\n"
+            size_report += f"{'AR (maxDets=10)':<30} {stats[7]:>12.4f}\n"
+            size_report += f"{'AR (maxDets=100)':<30} {stats[8]:>12.4f}\n"
+            size_report += f"{'AR (small: area < 32²)':<30} {stats[9]:>12.4f}\n"
+            size_report += f"{'AR (medium: 32² < area < 96²)':<30} {stats[10]:>12.4f}\n"
+            size_report += f"{'AR (large: area > 96²)':<30} {stats[11]:>12.4f}\n"
+
+            print(size_report)
+
+            # Guardar reporte de tamaño
+            size_report_path = os.path.join(args.base_eval_dir, "ap_by_size_report.txt")
+            with open(size_report_path, 'w') as f:
+                f.write(size_report)
+            print(f"Reporte AP por tamaño guardado en: {size_report_path}")
+
+            # Gráfica de AP/AR por tamaño
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+            # AP por tamaño
+            sizes = ['Small\n(<32²)', 'Medium\n(32²-96²)', 'Large\n(>96²)']
+            ap_by_size = [stats[3], stats[4], stats[5]]
+            colors_size = ['#e74c3c' if v < 0.3 else '#f39c12' if v < 0.5 else '#27ae60' for v in ap_by_size]
+            axes[0].bar(sizes, ap_by_size, color=colors_size, edgecolor='black')
+            axes[0].set_ylabel('Average Precision (AP)')
+            axes[0].set_title('AP por Tamaño de Objeto')
+            axes[0].set_ylim(0, 1)
+            axes[0].axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
+            for i, v in enumerate(ap_by_size):
+                axes[0].text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
+
+            # AR por tamaño
+            ar_by_size = [stats[9], stats[10], stats[11]]
+            colors_ar = ['#e74c3c' if v < 0.3 else '#f39c12' if v < 0.5 else '#27ae60' for v in ar_by_size]
+            axes[1].bar(sizes, ar_by_size, color=colors_ar, edgecolor='black')
+            axes[1].set_ylabel('Average Recall (AR)')
+            axes[1].set_title('AR por Tamaño de Objeto')
+            axes[1].set_ylim(0, 1)
+            axes[1].axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
+            for i, v in enumerate(ar_by_size):
+                axes[1].text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.base_eval_dir, "ap_ar_by_size.png"), dpi=150)
+            plt.close()
+            print(f"Gráfica AP/AR por tamaño guardada en: {args.base_eval_dir}/ap_ar_by_size.png")
+
+            # Diagnóstico de tamaño
+            print("\n  Diagnóstico por Tamaño:")
+            if stats[3] < 0.2:
+                print("  ALERTA: AP_small muy bajo (<0.2). El modelo tiene problemas con objetos pequeños.")
+                print("          Considerar: anchor sizes más pequeños, higher resolution, o augmentation de zoom.")
+            if stats[3] < stats[5] * 0.5:
+                print(f"  ALERTA: AP_small ({stats[3]:.3f}) << AP_large ({stats[5]:.3f})")
+                print("          El modelo favorece objetos grandes. Revisar escala de entrenamiento.")
+
     # --- RESUMEN DIAGNÓSTICO ---
     print("\n" + "=" * 70)
     print("RESUMEN DIAGNÓSTICO")
     print("=" * 70)
 
+    # Calcular métricas agregadas correctamente
+    total_tp = sum(class_tp.values())
+    total_fp_sum = sum(class_fp.values())
+    total_fn_sum = sum(class_fn.values())
+    total_gt_sum = sum(class_gt_total.values())
+
     # Estadísticas globales
     print(f"\n{'ESTADÍSTICAS GLOBALES':^70}")
     print("-" * 70)
-    print(f"  Total Ground Truth:       {total_gt:>8}")
+    print(f"  Total Ground Truth:       {total_gt_sum:>8}")
     print(f"  Total Predicciones:       {total_pred:>8}")
-    print(f"  Total Emparejados:        {total_matched:>8}")
-    print(f"  Falsos Negativos (FN):    {total_fn:>8}  ({100*total_fn/max(total_gt,1):.1f}% de GT)")
-    print(f"  Falsos Positivos (FP):    {total_fp:>8}  ({100*total_fp/max(total_pred,1):.1f}% de pred)")
+    print(f"  True Positives (TP):      {total_tp:>8}")
+    print(f"  False Negatives (FN):     {total_fn_sum:>8}  ({100*total_fn_sum/max(total_gt_sum,1):.1f}% de GT)")
+    print(f"  False Positives (FP):     {total_fp_sum:>8}  ({100*total_fp_sum/max(total_pred,1):.1f}% de pred)")
 
-    # Calcular recall y precision globales
-    global_recall = total_matched / max(total_gt, 1)
-    global_precision = total_matched / max(total_pred, 1)
-    print(f"\n  Recall Global:            {global_recall:>8.2%}")
-    print(f"  Precision Global:         {global_precision:>8.2%}")
+    # Métricas globales correctas (micro-average)
+    # Micro: suma todos los TP, FP, FN y calcula métricas globales
+    micro_precision = total_tp / max(total_tp + total_fp_sum, 1)
+    micro_recall = total_tp / max(total_tp + total_fn_sum, 1)
+    micro_f1 = 2 * (micro_precision * micro_recall) / max(micro_precision + micro_recall, 1e-10)
 
-    # Análisis por clase (especialmente las minoritarias)
+    print(f"\n  {'MICRO-AVERAGE (pondera por instancia):':^50}")
+    print(f"  Precision (Micro):        {micro_precision:>8.2%}")
+    print(f"  Recall (Micro):           {micro_recall:>8.2%}")
+    print(f"  F1-Score (Micro):         {micro_f1:>8.4f}")
+
+    # Macro-average: promedio simple de métricas por clase (igual peso a cada clase)
+    # Importante para datasets desbalanceados: da igual importancia a clases minoritarias
+    class_precisions = []
+    class_recalls = []
+    class_f1s = []
+    class_weights = []  # Para weighted average
+
+    for cat_id in sorted(label_map.keys()):
+        tp = class_tp.get(cat_id, 0)
+        fn = class_fn.get(cat_id, 0)
+        fp = class_fp.get(cat_id, 0)
+        gt_total = class_gt_total.get(cat_id, 0)
+
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * (precision * recall) / max(precision + recall, 1e-10)
+
+        class_precisions.append(precision)
+        class_recalls.append(recall)
+        class_f1s.append(f1)
+        class_weights.append(gt_total)
+
+    # Macro: promedio simple (cada clase cuenta igual)
+    macro_precision = np.mean(class_precisions)
+    macro_recall = np.mean(class_recalls)
+    macro_f1 = np.mean(class_f1s)
+
+    print(f"\n  {'MACRO-AVERAGE (igual peso por clase):':^50}")
+    print(f"  Precision (Macro):        {macro_precision:>8.2%}")
+    print(f"  Recall (Macro):           {macro_recall:>8.2%}")
+    print(f"  F1-Score (Macro):         {macro_f1:>8.4f}")
+
+    # Weighted: ponderado por número de GT de cada clase
+    total_weight = sum(class_weights)
+    if total_weight > 0:
+        weighted_precision = sum(p * w for p, w in zip(class_precisions, class_weights)) / total_weight
+        weighted_recall = sum(r * w for r, w in zip(class_recalls, class_weights)) / total_weight
+        weighted_f1 = sum(f * w for f, w in zip(class_f1s, class_weights)) / total_weight
+    else:
+        weighted_precision = weighted_recall = weighted_f1 = 0.0
+
+    print(f"\n  {'WEIGHTED-AVERAGE (ponderado por GT):':^50}")
+    print(f"  Precision (Weighted):     {weighted_precision:>8.2%}")
+    print(f"  Recall (Weighted):        {weighted_recall:>8.2%}")
+    print(f"  F1-Score (Weighted):      {weighted_f1:>8.4f}")
+
+    # G-Mean: Geometric Mean de recalls (muy sensible a clases con bajo rendimiento)
+    # Mejor métrica para datasets desbalanceados
+    if class_recalls and all(r > 0 for r in class_recalls):
+        g_mean = np.exp(np.mean(np.log(class_recalls)))
+    else:
+        # Si algún recall es 0, G-Mean es 0
+        g_mean = 0.0
+
+    print(f"\n  {'G-MEAN (sensible a clases minoritarias):':^50}")
+    print(f"  G-Mean:                   {g_mean:>8.4f}")
+    if g_mean < macro_f1 * 0.8:
+        print("  ALERTA: G-Mean << Macro-F1 indica problema severo en alguna clase")
+
+    # === MÉTRICAS DE LOCALIZACIÓN ===
+    print(f"\n  {'MÉTRICAS DE LOCALIZACIÓN:':^50}")
+    print("-" * 70)
+
+    # Localization Recall: % de GT que tienen match por IoU (independiente de clase)
+    localization_recall = total_matched / max(total_gt_sum, 1)
+    print(f"  Localization Recall:      {localization_recall:>8.2%}  (GT con match por IoU)")
+
+    # Mean IoU de matches
+    if all_match_ious:
+        mean_iou = np.mean(all_match_ious)
+        std_iou = np.std(all_match_ious)
+        min_iou = np.min(all_match_ious)
+        max_iou = np.max(all_match_ious)
+        print(f"  Mean IoU (matches):       {mean_iou:>8.4f}  (std: {std_iou:.4f})")
+        print(f"  IoU Range:                [{min_iou:.3f} - {max_iou:.3f}]")
+    else:
+        mean_iou = 0.0
+        print(f"  Mean IoU (matches):       N/A (sin matches)")
+
+    # === DESGLOSE DE ERRORES ===
+    print(f"\n  {'DESGLOSE DE ERRORES:':^50}")
+    print("-" * 70)
+
+    # Background FP Rate: predicciones que no matchean con ningún GT
+    background_fp_rate = background_fps / max(total_pred, 1)
+    print(f"  Background FP:            {background_fps:>8}  ({background_fp_rate:.1%} de predicciones)")
+    print("                            -> Detecciones 'fantasma' sin objeto real")
+
+    # Misclassification Rate: matches con IoU pero clase incorrecta
+    misclassification_rate = wrong_class_matches / max(total_matched, 1)
+    print(f"  Misclassifications:       {wrong_class_matches:>8}  ({misclassification_rate:.1%} de matches)")
+    print("                            -> Localiza bien pero clasifica mal")
+
+    # Correct detections
+    correct_detection_rate = correct_class_matches / max(total_matched, 1)
+    print(f"  Detecciones Correctas:    {correct_class_matches:>8}  ({correct_detection_rate:.1%} de matches)")
+
+    # Análisis de tipo de error predominante
+    print(f"\n  {'DIAGNÓSTICO DE ERRORES:':^50}")
+    if total_fn_sum > background_fps and total_fn_sum > wrong_class_matches:
+        print("  -> Problema principal: FALSOS NEGATIVOS (no detecta objetos)")
+        print("     Solución: Reducir detection_threshold o aumentar training")
+    elif background_fps > total_fn_sum and background_fps > wrong_class_matches:
+        print("  -> Problema principal: DETECCIONES FANTASMA (FP de background)")
+        print("     Solución: Aumentar detection_threshold o mejorar NMS")
+    elif wrong_class_matches > total_fn_sum and wrong_class_matches > background_fps:
+        print("  -> Problema principal: MISCLASSIFICACIÓN (localiza pero no clasifica)")
+        print("     Solución: Mejorar features de clasificación o class_weights")
+    else:
+        print("  -> Errores distribuidos entre FN, FP y misclassificación")
+
+    # Nota explicativa sobre las métricas
+    print(f"\n  {'INTERPRETACIÓN MÉTRICAS AGREGADAS:':^50}")
+    print("  - Micro: Dominado por clases con más instancias")
+    print("  - Macro: Igual peso a cada clase (mejor para desbalanceados)")
+    print("  - Weighted: Compromiso entre Micro y Macro")
+    print("  - G-Mean: Muy sensible a clases con recall bajo")
+    print("  - Para clases minoritarias, enfocarse en Macro-F1 y G-Mean")
+
+    # Análisis por clase (resaltando minoritarias si las hay)
+    header_suffix = " - Minoritarias marcadas con >>" if minority_classes else ""
     print(f"\n{'ANÁLISIS POR CLASE (Métricas de Detección)':^90}")
+    if minority_classes:
+        print(f"{'Clases minoritarias: ' + ', '.join(minority_classes):^90}")
     print("-" * 90)
     print(f"{'Clase':<20} {'GT':>6} {'TP':>6} {'FN':>6} {'FP':>6} {'Recall':>8} {'Precision':>10} {'F1':>8} {'Estado':>12}")
     print("-" * 90)
 
-    # Calcular TP por clase desde all_y_true y all_y_pred (matched pairs)
-    class_tp_count = Counter()
-    for yt, yp in zip(all_y_true, all_y_pred):
-        if yt == yp:  # Match correcto (mismo label)
-            class_tp_count[yt] += 1
-
-    # IMPORTANTE: Para cada clase calculamos:
+    # Métricas calculadas correctamente:
     # - TP: Detecciones correctas (matched con label correcto)
-    # - FN: Ground truth sin detectar
-    # - FP: Predicciones incorrectas (matched con label incorrecto + sin match)
-    # - Total GT = TP + FN (no solo los matched!)
-    # - Total Pred = TP + FP
-    # - Recall = TP / (TP + FN) = TP / Total_GT
-    # - Precision = TP / (TP + FP) = TP / Total_Pred
+    # - FN: GT sin detectar + GT emparejado con predicción de clase diferente
+    # - FP: Predicciones sin emparejar + predicciones emparejadas con GT de clase diferente
+    # - Recall = TP / (TP + FN)
+    # - Precision = TP / (TP + FP)
     # - F1 = 2 * (Precision * Recall) / (Precision + Recall)
 
-    minority_classes = ['Can', 'Metal_Debris']
     for cat_id in sorted(label_map.keys()):
         cat_name = label_map[cat_id]
 
-        # Contadores
-        tp = class_tp_count.get(cat_id, 0)
-        fn = fn_counter.get(cat_id, 0)
-        fp = fp_counter.get(cat_id, 0)
-
-        # CORRECCIÓN: Total GT incluye tanto TP como FN
-        total_gt = tp + fn
-        total_pred = tp + fp
+        # Contadores ya calculados correctamente durante la evaluación
+        tp = class_tp.get(cat_id, 0)
+        fn = class_fn.get(cat_id, 0)
+        fp = class_fp.get(cat_id, 0)
+        gt_total = class_gt_total.get(cat_id, 0)
 
         # Métricas
-        recall = tp / max(total_gt, 1)
-        precision = tp / max(total_pred, 1)
+        recall = tp / max(tp + fn, 1)
+        precision = tp / max(tp + fp, 1)
         f1 = 2 * (precision * recall) / max(precision + recall, 1e-10)
 
         # Determinar estado basado en F1-score
         if f1 < 0.3:
-            estado = "⚠️  CRÍTICO"
+            estado = "CRITICO"
         elif f1 < 0.5:
-            estado = "⚠️  BAJO"
+            estado = "BAJO"
         elif f1 < 0.7:
             estado = "MODERADO"
         else:
-            estado = "✓ BUENO"
+            estado = "BUENO"
 
-        # Resaltar clases minoritarias
+        # Resaltar clases minoritarias (solo si hay alguna detectada)
         prefix = ">> " if cat_name in minority_classes else "   "
-        print(f"{prefix}{cat_name:<17} {total_gt:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f} {estado:>12}")
+        print(f"{prefix}{cat_name:<17} {gt_total:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f} {estado:>12}")
 
     print("-" * 70)
 
@@ -1048,12 +1454,12 @@ def evaluate_on_dataset(args, cfg, device):
     problematic_classes = []
     for cat_id in sorted(label_map.keys()):
         cat_name = label_map[cat_id]
-        tp = class_tp_count.get(cat_id, 0)
-        fn = fn_counter.get(cat_id, 0)
-        total_gt = tp + fn
-        recall = tp / max(total_gt, 1)
-        if recall < 0.5 and total_gt > 10:  # Solo si hay suficientes muestras
-            problematic_classes.append((cat_name, recall, total_gt))
+        tp = class_tp.get(cat_id, 0)
+        fn = class_fn.get(cat_id, 0)
+        gt_total = class_gt_total.get(cat_id, 0)
+        recall = tp / max(tp + fn, 1)
+        if recall < 0.5 and gt_total > 10:  # Solo si hay suficientes muestras
+            problematic_classes.append((cat_name, recall, gt_total))
 
     if problematic_classes:
         print("\n  Clases con bajo recall (< 50%):")
@@ -1067,25 +1473,26 @@ def evaluate_on_dataset(args, cfg, device):
     else:
         print("\n  ✓ Todas las clases tienen recall >= 50%")
 
-    # Análisis de distribución de scores para clases problemáticas
-    print(f"\n{'ANÁLISIS DE SCORES (Clases Minoritarias)':^70}")
-    print("-" * 70)
-    for cat_name in minority_classes:
-        cat_id = next((k for k, v in label_map.items() if v == cat_name), None)
-        if cat_id is not None and cat_id in score_distribution:
-            scores = score_distribution[cat_id]
-            if scores:
-                above_05 = sum(1 for s in scores if s > 0.5)
-                above_025 = sum(1 for s in scores if s > 0.25)
-                above_01 = sum(1 for s in scores if s > 0.1)
-                total = len(scores)
-                print(f"\n  {cat_name}:")
-                print(f"    Total predicciones (antes de filtrar): {total}")
-                print(f"    Scores > 0.5: {above_05} ({100*above_05/max(total,1):.1f}%)")
-                print(f"    Scores > 0.25: {above_025} ({100*above_025/max(total,1):.1f}%)")
-                print(f"    Scores > 0.1: {above_01} ({100*above_01/max(total,1):.1f}%)")
-                if total > 0:
-                    print(f"    Score medio: {np.mean(scores):.3f}, mediana: {np.median(scores):.3f}")
+    # Análisis de distribución de scores para clases minoritarias (solo si las hay)
+    if minority_classes:
+        print(f"\n{'ANÁLISIS DE SCORES (Clases Minoritarias)':^70}")
+        print("-" * 70)
+        for cat_name in minority_classes:
+            cat_id = next((k for k, v in label_map.items() if v == cat_name), None)
+            if cat_id is not None and cat_id in score_distribution:
+                scores = score_distribution[cat_id]
+                if scores:
+                    above_05 = sum(1 for s in scores if s > 0.5)
+                    above_025 = sum(1 for s in scores if s > 0.25)
+                    above_01 = sum(1 for s in scores if s > 0.1)
+                    total = len(scores)
+                    print(f"\n  {cat_name}:")
+                    print(f"    Total predicciones (antes de filtrar): {total}")
+                    print(f"    Scores > 0.5: {above_05} ({100*above_05/max(total,1):.1f}%)")
+                    print(f"    Scores > 0.25: {above_025} ({100*above_025/max(total,1):.1f}%)")
+                    print(f"    Scores > 0.1: {above_01} ({100*above_01/max(total,1):.1f}%)")
+                    if total > 0:
+                        print(f"    Score medio: {np.mean(scores):.3f}, mediana: {np.median(scores):.3f}")
 
     print("\n" + "=" * 70)
 
@@ -1096,28 +1503,47 @@ def evaluate_on_dataset(args, cfg, device):
         f.write("=" * 70 + "\n\n")
         f.write("ESTADÍSTICAS GLOBALES\n")
         f.write("-" * 70 + "\n")
-        f.write(f"Total Ground Truth:       {total_gt}\n")
+        f.write(f"Total Ground Truth:       {total_gt_sum}\n")
         f.write(f"Total Predicciones:       {total_pred}\n")
-        f.write(f"Total Emparejados:        {total_matched}\n")
-        f.write(f"Falsos Negativos (FN):    {total_fn} ({100*total_fn/max(total_gt,1):.1f}% de GT)\n")
-        f.write(f"Falsos Positivos (FP):    {total_fp} ({100*total_fp/max(total_pred,1):.1f}% de pred)\n")
-        f.write(f"Recall Global:            {global_recall:.2%}\n")
-        f.write(f"Precision Global:         {global_precision:.2%}\n\n")
+        f.write(f"True Positives (TP):      {total_tp}\n")
+        f.write(f"False Negatives (FN):     {total_fn_sum} ({100*total_fn_sum/max(total_gt_sum,1):.1f}% de GT)\n")
+        f.write(f"False Positives (FP):     {total_fp_sum} ({100*total_fp_sum/max(total_pred,1):.1f}% de pred)\n\n")
 
-        f.write("POR CLASE (Métricas Corregidas)\n")
+        f.write("MÉTRICAS AGREGADAS\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Micro-Precision:          {micro_precision:.2%}\n")
+        f.write(f"Micro-Recall:             {micro_recall:.2%}\n")
+        f.write(f"Micro-F1:                 {micro_f1:.4f}\n")
+        f.write(f"Macro-Precision:          {macro_precision:.2%}\n")
+        f.write(f"Macro-Recall:             {macro_recall:.2%}\n")
+        f.write(f"Macro-F1:                 {macro_f1:.4f}\n")
+        f.write(f"Weighted-F1:              {weighted_f1:.4f}\n")
+        f.write(f"G-Mean:                   {g_mean:.4f}\n\n")
+
+        f.write("MÉTRICAS DE LOCALIZACIÓN\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Localization Recall:      {localization_recall:.2%}\n")
+        f.write(f"Mean IoU (matches):       {mean_iou:.4f}\n\n")
+
+        f.write("DESGLOSE DE ERRORES\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Background FP:            {background_fps} ({background_fp_rate:.1%} de pred)\n")
+        f.write(f"Misclassifications:       {wrong_class_matches} ({misclassification_rate:.1%} de matches)\n")
+        f.write(f"Detecciones Correctas:    {correct_class_matches} ({correct_detection_rate:.1%} de matches)\n\n")
+
+        f.write("POR CLASE\n")
         f.write("-" * 90 + "\n")
         f.write(f"{'Clase':<20} {'GT':>6} {'TP':>6} {'FN':>6} {'FP':>6} {'Recall':>8} {'Precision':>10} {'F1':>8}\n")
         for cat_id in sorted(label_map.keys()):
             cat_name = label_map[cat_id]
-            tp = class_tp_count.get(cat_id, 0)
-            fn = fn_counter.get(cat_id, 0)
-            fp = fp_counter.get(cat_id, 0)
-            total_gt = tp + fn
-            total_pred = tp + fp
-            recall = tp / max(total_gt, 1)
-            precision = tp / max(total_pred, 1)
+            tp = class_tp.get(cat_id, 0)
+            fn = class_fn.get(cat_id, 0)
+            fp = class_fp.get(cat_id, 0)
+            gt_total = class_gt_total.get(cat_id, 0)
+            recall = tp / max(tp + fn, 1)
+            precision = tp / max(tp + fp, 1)
             f1 = 2 * (precision * recall) / max(precision + recall, 1e-10)
-            f.write(f"{cat_name:<20} {total_gt:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f}\n")
+            f.write(f"{cat_name:<20} {gt_total:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f}\n")
 
     print(f"Resumen diagnóstico guardado en: {diag_report_path}")
 
@@ -1136,7 +1562,7 @@ def main():
     parser.add_argument('--matching_method', type=str, default='hungarian', choices=['hungarian', 'greedy'],
                         help="Método de matching: 'hungarian' (óptimo, estándar DETR) o 'greedy' (más rápido, basado en scores).")
     parser.add_argument('--output_dir', type=str, default='eval_results', help="Directorio base para guardar resultados.")
-    parser.add_argument('--coco_eval', action='store_true', help="Activar evaluación de mAP con pycocotools.")
+    parser.add_argument('--coco_eval', action='store_true', default=True, help="Activar evaluación de mAP con pycocotools.")
     parser.add_argument('--draw', action='store_true', help="Guardar imágenes con detecciones dibujadas.")
     parser.add_argument('--debug', action='store_true', help="Guardar imágenes de debug comparativas entre predicción y ground truth cuando hay diferencias.")
 
