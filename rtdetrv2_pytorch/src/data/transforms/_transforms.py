@@ -148,3 +148,108 @@ class ToDtype(T.ToDtype):
     def __init__(self, dtype, scale=False):
         torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
         super().__init__(dtype=torch_dtype, scale=scale)
+
+
+@register()
+class SyntheticDomainAdaptation(nn.Module):
+    """
+    Transform específico para cerrar el domain gap entre imágenes sintéticas y reales.
+
+    NUEVO: Soporta ajustes independientes por canal RGB basados en análisis de domain gap.
+
+    Uso:
+        # Con parámetros de domain_gap_analysis.json:
+        - {type: SyntheticDomainAdaptation,
+           brightness_factor: [0.80, 0.90],
+           red_adjustment: [0.85, 0.95],
+           green_adjustment: [0.90, 1.00],
+           blue_adjustment: [0.75, 0.85],
+           p: 0.7}
+
+        # Modo legacy (backward compatible):
+        - {type: SyntheticDomainAdaptation,
+           brightness_factor: [0.75, 0.90],
+           blue_reduction: [0.75, 0.90],
+           green_reduction: [0.85, 0.95],
+           p: 0.7}
+    """
+    def __init__(self,
+                 brightness_factor=(0.7, 0.9),      # Ajuste global de brillo
+                 red_adjustment=None,               # NUEVO: Ajuste específico canal R
+                 green_adjustment=None,             # NUEVO: Ajuste específico canal G
+                 blue_adjustment=None,              # NUEVO: Ajuste específico canal B
+                 # Legacy parameters (backward compatibility)
+                 blue_reduction=None,               # Legacy: reducir azul
+                 green_reduction=None,              # Legacy: reducir verde
+                 p=0.7):
+        super().__init__()
+        self.brightness_factor = brightness_factor
+
+        # Si se usan parámetros nuevos (red/green/blue_adjustment), usarlos
+        # Si no, usar legacy (blue_reduction, green_reduction)
+        if red_adjustment is not None:
+            self.red_adjustment = red_adjustment
+            self.green_adjustment = green_adjustment if green_adjustment is not None else (1.0, 1.0)
+            self.blue_adjustment = blue_adjustment if blue_adjustment is not None else (1.0, 1.0)
+        else:
+            # Modo legacy: solo brillo + reducción de green/blue
+            self.red_adjustment = (1.0, 1.0)  # Sin ajuste
+            self.green_adjustment = green_reduction if green_reduction is not None else (0.85, 0.95)
+            self.blue_adjustment = blue_reduction if blue_reduction is not None else (0.7, 0.9)
+
+        self.p = p
+
+    def forward(self, img, target):
+        if torch.rand(1) < self.p:
+            if isinstance(img, torch.Tensor):
+                # Generar factores aleatorios para cada canal
+                b_factor = torch.empty(1).uniform_(*self.brightness_factor).item()
+                r_factor = torch.empty(1).uniform_(*self.red_adjustment).item()
+                g_factor = torch.empty(1).uniform_(*self.green_adjustment).item()
+                blue_factor = torch.empty(1).uniform_(*self.blue_adjustment).item()
+
+                # Aplicar ajustes por canal
+                if img.dim() == 3:
+                    if img.shape[0] == 3:  # CHW (C, H, W)
+                        img = img.clone()
+                        img[0] = img[0] * b_factor * r_factor      # R: brillo × ajuste_R
+                        img[1] = img[1] * b_factor * g_factor      # G: brillo × ajuste_G
+                        img[2] = img[2] * b_factor * blue_factor   # B: brillo × ajuste_B
+                    elif img.shape[2] == 3:  # HWC (H, W, C)
+                        img = img.clone()
+                        img[:, :, 0] = img[:, :, 0] * b_factor * r_factor
+                        img[:, :, 1] = img[:, :, 1] * b_factor * g_factor
+                        img[:, :, 2] = img[:, :, 2] * b_factor * blue_factor
+
+                # Clamp para mantener rango válido
+                img = torch.clamp(img, 0, 1 if img.max() <= 1 else 255)
+
+        return img, target
+
+
+@register()
+class RandomBrightnessContrast(nn.Module):
+    """
+    Ajuste más agresivo de brillo y contraste para domain adaptation.
+    """
+    def __init__(self, brightness=(0.6, 1.2), contrast=(0.8, 1.2), p=0.5):
+        super().__init__()
+        self.brightness = brightness
+        self.contrast = contrast
+        self.p = p
+
+    def forward(self, img, target):
+        if torch.rand(1) < self.p:
+            if isinstance(img, torch.Tensor):
+                # Ajuste de brillo
+                b = torch.empty(1).uniform_(*self.brightness).item()
+                img = img * b
+
+                # Ajuste de contraste
+                c = torch.empty(1).uniform_(*self.contrast).item()
+                mean = img.mean()
+                img = (img - mean) * c + mean
+
+                img = torch.clamp(img, 0, 1 if img.max() <= 1 else 255)
+
+        return img, target

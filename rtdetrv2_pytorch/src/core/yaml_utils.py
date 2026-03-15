@@ -22,6 +22,9 @@ INCLUDE_KEY = '__include__'
 def load_config(file_path, cfg=dict()):
     """load config
     """
+    # Convert to absolute path for consistent resolution of relative includes
+    file_path = os.path.abspath(file_path)
+
     _, ext = os.path.splitext(file_path)
     assert ext in ['.yml', '.yaml'], "only support yaml files"
 
@@ -38,6 +41,9 @@ def load_config(file_path, cfg=dict()):
 
             if not base_yaml.startswith('/'):
                 base_yaml = os.path.join(os.path.dirname(file_path), base_yaml)
+
+            # Normalize path to resolve ../ sequences
+            base_yaml = os.path.normpath(base_yaml)
 
             with open(base_yaml) as f:
                 base_cfg = load_config(base_yaml, cfg)

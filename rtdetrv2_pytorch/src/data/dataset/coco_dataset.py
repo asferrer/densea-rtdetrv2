@@ -175,7 +175,9 @@ class ConvertCocoPolysToMask(object):
 
         target_out["area"] = torch.tensor([obj["area"] for obj in anno])[keep]
         target_out["iscrowd"] = torch.tensor([obj.get("iscrowd", 0) for obj in anno])[keep]
-        target_out["orig_size"] = torch.as_tensor([int(h), int(w)])
+        # IMPORTANTE: El postprocessor espera [W, H] según la documentación
+        # Ver box_revert.py línea 38: "orig_sizes(Tensor), [N, 2], (w, h)"
+        target_out["orig_size"] = torch.as_tensor([int(w), int(h)])
     
         return image, target_out
 

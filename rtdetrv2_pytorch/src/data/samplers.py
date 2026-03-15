@@ -12,7 +12,7 @@ import random
 
 from ..core import register
 
-__all__ = ['ClassBalancedSampler']
+__all__ = ['ClassBalancedSampler', 'DomainBalancedSampler']
 
 
 @register()
@@ -313,3 +313,187 @@ class ClassAwareRandomSampler(Sampler):
     def __len__(self):
         self._ensure_initialized()
         return self.num_samples
+
+
+@register()
+class DomainBalancedSampler(Sampler):
+    """
+    Sampler that ensures each batch contains exactly 50% real and 50% synthetic images.
+
+    Works by partitioning dataset indices into two pools (real and synthetic),
+    shuffling each independently per epoch, resampling the smaller pool to match
+    the larger, then interleaving indices so every consecutive batch_size block
+    is balanced 50/50.
+
+    Requires that images in the COCO annotation JSON have a "source" field
+    with values "real" or "synthetic" (added during dataset preparation).
+
+    Args:
+        dataset: Dataset with COCO-style annotations (injected by DataLoader)
+        batch_size: Training batch size (must be even)
+        source_field: Key in image dict indicating domain (default: 'source')
+        real_label: Value of source_field for real images (default: 'real')
+        synthetic_label: Value of source_field for synthetic images (default: 'synthetic')
+        seed: Random seed for reproducibility (default: 21)
+
+    Example YAML configuration:
+        train_dataloader:
+            type: DataLoader
+            dataset: ...
+            sampler:
+                type: DomainBalancedSampler
+                batch_size: 32
+                seed: 21
+    """
+
+    def __init__(
+        self,
+        dataset=None,
+        batch_size=32,
+        source_field='source',
+        real_label='real',
+        synthetic_label='synthetic',
+        seed=21
+    ):
+        self._dataset = dataset
+        self.batch_size = batch_size
+        self.source_field = source_field
+        self.real_label = real_label
+        self.synthetic_label = synthetic_label
+        self.seed = seed
+        self._epoch = 0
+        self._initialized = False
+        self.real_indices = []
+        self.synthetic_indices = []
+        self._length = 0
+
+        if dataset is not None:
+            self._build_index()
+            self._initialized = True
+
+    @property
+    def dataset(self):
+        return self._dataset
+
+    @dataset.setter
+    def dataset(self, value):
+        """Setter para cuando el dataset se asigna después de la creación."""
+        self._dataset = value
+        if value is not None and not self._initialized:
+            self._build_index()
+            self._initialized = True
+
+    def _build_index(self):
+        """Partition dataset indices into real and synthetic pools."""
+        coco = self.dataset.coco
+
+        # Build image_id -> source mapping from COCO metadata
+        img_id_to_source = {}
+        for img_info in coco.dataset['images']:
+            img_id_to_source[img_info['id']] = img_info.get(self.source_field, None)
+
+        self.real_indices = []
+        self.synthetic_indices = []
+        unknown_count = 0
+
+        for idx, img_id in enumerate(self.dataset.ids):
+            source = img_id_to_source.get(img_id, None)
+            if source == self.real_label:
+                self.real_indices.append(idx)
+            elif source == self.synthetic_label:
+                self.synthetic_indices.append(idx)
+            else:
+                # Fallback: use file_name heuristic for backward compatibility
+                file_name = coco.loadImgs(img_id)[0].get('file_name', '')
+                if 'synthetic' in file_name.lower():
+                    self.synthetic_indices.append(idx)
+                else:
+                    self.real_indices.append(idx)
+                unknown_count += 1
+
+        half_batch = self.batch_size // 2
+        larger_pool = max(len(self.real_indices), len(self.synthetic_indices))
+        num_batches = larger_pool // half_batch
+        self._length = num_batches * self.batch_size
+
+        print(f"\n[DomainBalancedSampler] Inicializado:")
+        print(f"  - Imágenes reales: {len(self.real_indices)}")
+        print(f"  - Imágenes sintéticas: {len(self.synthetic_indices)}")
+        print(f"  - Batch size: {self.batch_size} (half={half_batch})")
+        print(f"  - Batches balanceados por época: {num_batches}")
+        print(f"  - Total muestras por época: {self._length}")
+        if unknown_count > 0:
+            print(f"  - AVISO: {unknown_count} imágenes sin campo '{self.source_field}' (clasificadas por heurística)")
+        if len(self.real_indices) != len(self.synthetic_indices):
+            smaller = 'real' if len(self.real_indices) < len(self.synthetic_indices) else 'sintético'
+            ratio = min(len(self.real_indices), len(self.synthetic_indices))
+            larger = max(len(self.real_indices), len(self.synthetic_indices))
+            print(f"  - Re-muestreo: pool {smaller} ({ratio}) será re-muestreado para igualar al mayor ({larger})")
+
+    def _ensure_initialized(self):
+        """Ensure the sampler is initialized before use."""
+        if not self._initialized and self._dataset is not None:
+            self._build_index()
+            self._initialized = True
+
+    def set_epoch(self, epoch):
+        """Set epoch for reproducible shuffling."""
+        self._epoch = epoch
+
+    def __iter__(self):
+        """Iterate over balanced indices: each batch_size block has 50% real + 50% synthetic."""
+        self._ensure_initialized()
+
+        g = torch.Generator()
+        g.manual_seed(self.seed + self._epoch)
+
+        half_batch = self.batch_size // 2
+        larger_pool_size = max(len(self.real_indices), len(self.synthetic_indices))
+        num_batches = larger_pool_size // half_batch
+        target_size = num_batches * half_batch
+
+        # Shuffle and resample real indices to target_size
+        real_shuffled = self._shuffle_and_resample(
+            self.real_indices, target_size, g
+        )
+
+        # Shuffle and resample synthetic indices to target_size
+        synth_shuffled = self._shuffle_and_resample(
+            self.synthetic_indices, target_size, g
+        )
+
+        # Interleave: for each batch, first half_batch real, then half_batch synthetic
+        indices = []
+        for batch_idx in range(num_batches):
+            start = batch_idx * half_batch
+            end = start + half_batch
+            indices.extend(real_shuffled[start:end])
+            indices.extend(synth_shuffled[start:end])
+
+        return iter(indices)
+
+    def _shuffle_and_resample(self, pool, target_size, generator):
+        """Shuffle a pool of indices and resample (with replacement) to reach target_size."""
+        if len(pool) == 0:
+            return [0] * target_size  # Should not happen in balanced experiments
+
+        # Shuffle the pool
+        perm = torch.randperm(len(pool), generator=generator).tolist()
+        shuffled = [pool[i] for i in perm]
+
+        if len(shuffled) >= target_size:
+            return shuffled[:target_size]
+
+        # Resample with replacement to fill remaining slots
+        result = list(shuffled)
+        extra_needed = target_size - len(result)
+        extra_indices = torch.randint(
+            0, len(pool), (extra_needed,), generator=generator
+        ).tolist()
+        result.extend([pool[i] for i in extra_indices])
+        return result
+
+    def __len__(self):
+        """Return total number of samples per epoch."""
+        self._ensure_initialized()
+        return self._length
