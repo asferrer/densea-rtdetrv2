@@ -18,23 +18,42 @@ import sys
 import argparse
 import time
 import numpy as np
+
+# Optimización de memoria PyTorch para Jetson (debe ir ANTES de import torch)
+if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,garbage_collection_threshold:0.6'
+
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 import colorsys
+import gc
 import json
-from sklearn.metrics import confusion_matrix, classification_report
 from collections import Counter
-from scipy.optimize import linear_sum_assignment
 
-# Configurar matplotlib para usar backend no-interactivo ANTES de importar pyplot
-# Esto evita errores de Tkinter en entornos headless o threads secundarios
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
+# --- Imports opcionales (el script no crashea si faltan) ---
+try:
+    from sklearn.metrics import confusion_matrix, classification_report
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+try:
+    from scipy.optimize import linear_sum_assignment
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    PLOTTING_AVAILABLE = False
 
 # --- Importaciones para Inferencia y Evaluación ---
 
@@ -74,7 +93,13 @@ class PyTorchEngine(nn.Module):
         return labels, boxes, scores
 
 class ONNXEngine:
-    """Wrapper para la inferencia con ONNX Runtime."""
+    """Wrapper para la inferencia con ONNX Runtime.
+
+    Optimizado para Jetson Orin Nano (8GB RAM compartida CPU/GPU):
+    - Limita arena GPU para dejar memoria a PyTorch y al sistema
+    - Usa búsqueda heurística de cuDNN (evita allocations de benchmarking)
+    - Soporta fallback automático a CPU si CUDA no tiene memoria
+    """
     def __init__(self, model_path, device_str):
         try:
             import onnxruntime as ort
@@ -82,101 +107,207 @@ class ONNXEngine:
             raise ImportError("ONNX Runtime no está instalado. Instálalo con: pip install onnxruntime-gpu")
 
         print(f"Cargando modelo ONNX desde: {model_path}")
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'cuda' in device_str else ['CPUExecutionProvider']
-        
-        self.session = ort.InferenceSession(model_path, providers=providers)
+
+        # Session options para uso eficiente de memoria
+        sess_options = ort.SessionOptions()
+        sess_options.enable_mem_pattern = True        # Reusar patrones de memoria
+        sess_options.enable_cpu_mem_arena = False      # No pre-alocar arena CPU (ahorra RAM)
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        if 'cuda' in device_str:
+            # Liberar cache de PyTorch ANTES de inicializar ONNX Runtime
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            providers = [
+                ('CUDAExecutionProvider', {
+                    # Limitar arena GPU a 1GB (Jetson tiene 8GB compartidos)
+                    'gpu_mem_limit': 1 * 1024 * 1024 * 1024,
+                    # Alocar solo lo necesario (no redondear a potencia de 2)
+                    'arena_extend_strategy': 'kSameAsRequested',
+                    # Heurística en vez de exhaustiva (evita allocations temporales grandes)
+                    'cudnn_conv_algo_search': 'HEURISTIC',
+                    # No usar workspace máximo de cuDNN
+                    'cudnn_conv_use_max_workspace': '0',
+                    'do_copy_in_default_stream': '1',
+                }),
+                ('CPUExecutionProvider', {}),
+            ]
+        else:
+            providers = [('CPUExecutionProvider', {})]
+
+        try:
+            self.session = ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+        except Exception as e:
+            print(f"Error creando sesión con providers solicitados: {e}")
+            print("Intentando con CPUExecutionProvider...")
+            self.session = ort.InferenceSession(
+                model_path, sess_options=sess_options,
+                providers=[('CPUExecutionProvider', {})]
+            )
+
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
-        self.device = torch.device(device_str)
-        print(f"Modelo ONNX cargado. Usando proveedor: {self.session.get_providers()[0]}")
+
+        # Determinar device real según el proveedor activo (puede caer a CPU por OOM)
+        active_provider = self.session.get_providers()[0]
+        if 'CUDA' in active_provider:
+            self.device = torch.device(device_str)
+        else:
+            print("ONNX Runtime usando CPU. Evaluación continuará en CPU (más lento pero estable).")
+            self.device = torch.device('cpu')
+        print(f"Modelo ONNX cargado. Usando proveedor: {active_provider}")
 
     def __call__(self, images, orig_target_sizes):
+        # Cast orig_target_sizes a int32 (el ONNX fue exportado con int32)
+        sizes_np = orig_target_sizes.cpu().numpy().astype(np.int32)
         inputs = {
             self.input_names[0]: images.cpu().numpy(),
-            self.input_names[1]: orig_target_sizes.cpu().numpy()
+            self.input_names[1]: sizes_np
         }
         outputs = self.session.run(self.output_names, inputs)
-        
+
         labels = torch.from_numpy(outputs[0]).to(self.device)
         boxes = torch.from_numpy(outputs[1]).to(self.device)
         scores = torch.from_numpy(outputs[2]).to(self.device)
+
+        # Asegurar dimensión de batch (algunos modelos ONNX la omiten)
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+        if boxes.dim() == 2:
+            boxes = boxes.unsqueeze(0)
+        if scores.dim() == 1:
+            scores = scores.unsqueeze(0)
+
         return labels, boxes, scores
 
 class TensorRTEngine:
     """
-    Wrapper para la inferencia con TensorRT.
-    Gestiona la carga del motor, la asignación de buffers y la ejecución asíncrona.
+    Wrapper para la inferencia con TensorRT 10.x.
+    Usa buffers PyTorch CUDA (en vez de PyCUDA) para evitar conflictos de streams
+    con los aux streams internos de TRT 10.x en Jetson.
     """
+
+    # Mapeo TRT dtype → torch dtype
+    _TRT_TO_TORCH = None
+
+    @staticmethod
+    def _trt_dtype_to_torch(trt, trt_dtype):
+        if TensorRTEngine._TRT_TO_TORCH is None:
+            TensorRTEngine._TRT_TO_TORCH = {
+                trt.float32: torch.float32,
+                trt.float16: torch.float16,
+                trt.int32:   torch.int32,
+                trt.int64:   torch.int64,
+                trt.int8:    torch.int8,
+                trt.bool:    torch.bool,
+            }
+        return TensorRTEngine._TRT_TO_TORCH.get(trt_dtype, torch.float32)
+
     def __init__(self, engine_path, device_str):
         try:
             import tensorrt as trt
-            # Se importan aquí para que el script no falle si solo se usa ONNX o PyTorch
-            import pycuda.driver as cuda
-            import pycuda.autoinit  # crucial para la gestión automática del contexto
-            self.cuda = cuda
+            self.trt = trt
         except ImportError as e:
             raise ImportError(f"Dependencia faltante para TensorRT: {e}. Revisa la instalación.")
+
+        # Liberar cache de PyTorch ANTES de alocar buffers TensorRT
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        self.device = torch.device(device_str)
+        self.stream = torch.cuda.Stream(device=self.device)
 
         print(f"Cargando motor de TensorRT desde: {engine_path}")
         logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
         with open(engine_path, 'rb') as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
-        
+
         if not self.engine:
             raise RuntimeError("No se pudo deserializar el motor de TensorRT. Verifica el archivo y los permisos.")
 
         self.context = self.engine.create_execution_context()
-        self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers()
-        self.device = torch.device(device_str)
+        self.tensors = self._allocate_buffers()
         print("Motor de TensorRT cargado exitosamente.")
 
     def _allocate_buffers(self):
-        inputs, outputs, bindings = [], [], []
-        stream = self.cuda.Stream()
-        
-        for binding_name in self.engine:
-            binding_idx = self.engine.get_binding_index(binding_name)
-            shape = tuple(self.context.get_binding_shape(binding_idx))
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding_idx))
-            size = trt.volume(shape)
-            
-            host_mem = self.cuda.pagelocked_empty(size, dtype)
-            device_mem = self.cuda.mem_alloc(host_mem.nbytes)
-            bindings.append(int(device_mem))
-            
-            buffer_info = {'host': host_mem, 'device': device_mem, 'shape': shape, 'name': binding_name}
-            if self.engine.binding_is_input(binding_name):
-                inputs.append(buffer_info)
-            else:
-                outputs.append(buffer_info)
-                
-        return inputs, outputs, bindings, stream
+        """Asigna buffers como tensores PyTorch CUDA (compatibles con TRT streams)."""
+        tensors = {}
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            shape = tuple(self.engine.get_tensor_shape(name))
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            torch_dtype = self._trt_dtype_to_torch(self.trt, trt_dtype)
+            mode = self.engine.get_tensor_mode(name)
+
+            # Manejar dimensiones dinámicas (-1) con valores esperados
+            if -1 in shape:
+                if name == "images":
+                    shape = (1, 3, 640, 640)
+                elif name == "orig_target_sizes":
+                    shape = (1, 2)
+                elif "labels" in name or "scores" in name:
+                    shape = (1, 300)
+                elif "boxes" in name:
+                    shape = (1, 300, 4)
+
+            # Configurar shapes de entrada para dimensiones dinámicas
+            if mode == self.trt.TensorIOMode.INPUT:
+                self.context.set_input_shape(name, shape)
+
+            # Alocar tensor GPU con torch (comparte CUDA context con TRT)
+            tensor = torch.empty(shape, dtype=torch_dtype, device=self.device).contiguous()
+            self.context.set_tensor_address(name, tensor.data_ptr())
+
+            tensors[name] = {
+                'tensor': tensor,
+                'shape': shape,
+                'name': name,
+                'dtype': torch_dtype,
+                'is_input': mode == self.trt.TensorIOMode.INPUT,
+            }
+
+        return tensors
+
+    def warmup(self, n=50):
+        """Ejecuta inferencias de warmup para estabilizar GPU clocks y JIT en Jetson."""
+        with torch.cuda.stream(self.stream):
+            for _ in range(n):
+                self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
+            self.stream.synchronize()
+        print(f"[TRT] Warmup completado ({n} iteraciones)")
 
     def __call__(self, images, orig_target_sizes):
-        np.copyto(self.inputs[0]['host'], images.cpu().numpy().ravel())
-        np.copyto(self.inputs[1]['host'], orig_target_sizes.cpu().numpy().ravel())
+        # Copiar inputs a los buffers GPU con cast de dtype correcto
+        img_buf = self.tensors["images"]
+        size_buf = self.tensors["orig_target_sizes"]
 
-        self.cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
-        self.cuda.memcpy_htod_async(self.inputs[1]['device'], self.inputs[1]['host'], self.stream)
-        
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        
-        for out in self.outputs:
-            self.cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
-        
-        self.stream.synchronize()
-        
-        batch_size = images.shape[0]
-        # La forma de las salidas puede variar, asegúrate de que coincida con tu modelo
-        # Asumiendo una salida estándar de [batch, 300] para etiquetas/scores y [batch, 300, 4] para cajas
-        num_dets = self.outputs[0]['shape'][-1] if len(self.outputs[0]['shape']) > 1 else self.outputs[0]['shape'][0]
-        
-        labels = torch.from_numpy(self.outputs[0]['host']).reshape(batch_size, num_dets)
-        boxes = torch.from_numpy(self.outputs[1]['host']).reshape(batch_size, num_dets, 4)
-        scores = torch.from_numpy(self.outputs[2]['host']).reshape(batch_size, num_dets)
+        with torch.cuda.stream(self.stream):
+            img_buf['tensor'].copy_(images[:1])  # batch=1
+            size_buf['tensor'].copy_(orig_target_sizes[:1].to(size_buf['dtype']))
 
-        return labels.to(self.device), boxes.to(self.device), scores.to(self.device)
+            self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
+            self.stream.synchronize()
+
+        # Leer outputs directamente de los tensores GPU
+        labels = self.tensors['labels']['tensor'].clone()
+        boxes = self.tensors['boxes']['tensor'].clone()
+        scores = self.tensors['scores']['tensor'].clone()
+
+        # Asegurar dimensión de batch
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+        if boxes.dim() == 2:
+            boxes = boxes.unsqueeze(0)
+        if scores.dim() == 1:
+            scores = scores.unsqueeze(0)
+
+        return labels, boxes, scores
 
 # --- Funciones auxiliares y bucle principal (sin cambios) ---
 
@@ -517,6 +648,8 @@ def match_detections_hungarian(gt_boxes, gt_labels, pred_boxes, pred_labels, pre
     cost_matrix = -iou_matrix
 
     # 3. Aplicar Hungarian Algorithm para encontrar el matching óptimo
+    if not SCIPY_AVAILABLE:
+        raise RuntimeError("scipy es necesario para match_detections_hungarian. Instálalo con: pip install scipy")
     pred_indices, gt_indices = linear_sum_assignment(cost_matrix)
 
     # 4. Filtrar matches que no superen el threshold de IoU
@@ -644,7 +777,10 @@ def evaluate_on_dataset(args, cfg, device):
     print("=" * 70 + "\n")
 
     # Generar distribución del dataset
-    plot_val_dataset_distribution(dataset, label_map, args)
+    if PLOTTING_AVAILABLE:
+        plot_val_dataset_distribution(dataset, label_map, args)
+    else:
+        print("matplotlib no disponible. Saltando gráfica de distribución.")
 
     all_y_true, all_y_pred = [], []
     coco_predictions = []
@@ -882,8 +1018,9 @@ def evaluate_on_dataset(args, cfg, device):
         print(f"\n--- Clases minoritarias detectadas (< 50% de la media): {', '.join(minority_classes)} ---")
 
     # --- Distribución de Scores por Clase ---
-    print("\n--- Generando distribución de scores por clase ---")
-    plot_score_distributions(score_distribution, label_map, args.base_eval_dir, args.detection_threshold, minority_classes)
+    if PLOTTING_AVAILABLE:
+        print("\n--- Generando distribución de scores por clase ---")
+        plot_score_distributions(score_distribution, label_map, args.base_eval_dir, args.detection_threshold, minority_classes)
 
     print("\n--- Métricas de Clasificación (basado en IoU) ---")
 
@@ -897,6 +1034,10 @@ def evaluate_on_dataset(args, cfg, device):
             target_names.append(label_map.get(l, f"Clase_{l}"))
 
         try:
+            if not labels_to_report:
+                raise ValueError("No hay detecciones emparejadas — el modelo no produjo detecciones válidas")
+            if not SKLEARN_AVAILABLE:
+                raise ImportError("sklearn no disponible")
             report = classification_report(all_y_true, all_y_pred, labels=labels_to_report,
                                            target_names=target_names,
                                            zero_division=0, digits=4)
@@ -1004,49 +1145,52 @@ def evaluate_on_dataset(args, cfg, device):
         print(f"Reporte de detección completo guardado en: {complete_report_path}")
 
         # Generar matriz de confusión con nombres correctos
-        cm = confusion_matrix(all_y_true, all_y_pred, labels=labels_to_report)
+        if SKLEARN_AVAILABLE and PLOTTING_AVAILABLE and labels_to_report:
+            cm = confusion_matrix(all_y_true, all_y_pred, labels=labels_to_report)
 
-        # Calcular tamaño dinámico basado en número de clases
-        num_classes = len(labels_to_report)
-        fig_size = max(10, num_classes * 0.8)
+            # Calcular tamaño dinámico basado en número de clases
+            num_classes = len(labels_to_report)
+            fig_size = max(10, num_classes * 0.8)
 
-        # Matriz de confusión con valores absolutos
-        plt.figure(figsize=(fig_size, fig_size))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=target_names,
-                    yticklabels=target_names,
-                    cbar_kws={'label': 'Cantidad'})
-        plt.xlabel("Predicción", fontsize=12)
-        plt.ylabel("Real (Ground Truth)", fontsize=12)
-        plt.title("Matriz de Confusión (Valores Absolutos)\n[Solo detecciones emparejadas por IoU]", fontsize=14, fontweight='bold')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        cm_path = os.path.join(args.base_eval_dir, 'confusion_matrix.png')
-        plt.tight_layout()
-        plt.savefig(cm_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Matriz de confusión guardada en: {cm_path}")
+            # Matriz de confusión con valores absolutos
+            plt.figure(figsize=(fig_size, fig_size))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                        xticklabels=target_names,
+                        yticklabels=target_names,
+                        cbar_kws={'label': 'Cantidad'})
+            plt.xlabel("Predicción", fontsize=12)
+            plt.ylabel("Real (Ground Truth)", fontsize=12)
+            plt.title("Matriz de Confusión (Valores Absolutos)\n[Solo detecciones emparejadas por IoU]", fontsize=14, fontweight='bold')
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks(rotation=0)
+            cm_path = os.path.join(args.base_eval_dir, 'confusion_matrix.png')
+            plt.tight_layout()
+            plt.savefig(cm_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Matriz de confusión guardada en: {cm_path}")
 
-        # Matriz de confusión NORMALIZADA (por fila = por clase GT)
-        # Importante para datasets desbalanceados: muestra proporciones en lugar de absolutos
-        cm_normalized = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-10)
+            # Matriz de confusión NORMALIZADA (por fila = por clase GT)
+            # Importante para datasets desbalanceados: muestra proporciones en lugar de absolutos
+            cm_normalized = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-10)
 
-        plt.figure(figsize=(fig_size, fig_size))
-        sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues',
-                    xticklabels=target_names,
-                    yticklabels=target_names,
-                    cbar_kws={'label': 'Proporción'},
-                    vmin=0, vmax=1)
-        plt.xlabel("Predicción", fontsize=12)
-        plt.ylabel("Real (Ground Truth)", fontsize=12)
-        plt.title("Matriz de Confusión Normalizada (por fila)\n[Muestra tasa de clasificación correcta por clase]", fontsize=14, fontweight='bold')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        cm_norm_path = os.path.join(args.base_eval_dir, 'confusion_matrix_normalized.png')
-        plt.tight_layout()
-        plt.savefig(cm_norm_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Matriz de confusión normalizada guardada en: {cm_norm_path}")
+            plt.figure(figsize=(fig_size, fig_size))
+            sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues',
+                        xticklabels=target_names,
+                        yticklabels=target_names,
+                        cbar_kws={'label': 'Proporción'},
+                        vmin=0, vmax=1)
+            plt.xlabel("Predicción", fontsize=12)
+            plt.ylabel("Real (Ground Truth)", fontsize=12)
+            plt.title("Matriz de Confusión Normalizada (por fila)\n[Muestra tasa de clasificación correcta por clase]", fontsize=14, fontweight='bold')
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks(rotation=0)
+            cm_norm_path = os.path.join(args.base_eval_dir, 'confusion_matrix_normalized.png')
+            plt.tight_layout()
+            plt.savefig(cm_norm_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Matriz de confusión normalizada guardada en: {cm_norm_path}")
+        else:
+            print("sklearn o matplotlib no disponibles. Saltando matrices de confusión.")
 
         # Generar reporte y gráfica de Falsos Positivos y Falsos Negativos
         print("\n--- Generando reporte de Falsos Positivos y Falsos Negativos ---")
@@ -1066,25 +1210,26 @@ def evaluate_on_dataset(args, cfg, device):
         print(f"Reporte de FP/FN guardado en: {fp_fn_report_path}")
 
         # Graficar los contadores de FP y FN por clase
-        classes = [label_map[k] for k in sorted(label_map.keys())]
-        fp_counts = [class_fp.get(k, 0) for k in sorted(label_map.keys())]
-        fn_counts = [class_fn.get(k, 0) for k in sorted(label_map.keys())]
+        if PLOTTING_AVAILABLE:
+            classes = [label_map[k] for k in sorted(label_map.keys())]
+            fp_counts = [class_fp.get(k, 0) for k in sorted(label_map.keys())]
+            fn_counts = [class_fn.get(k, 0) for k in sorted(label_map.keys())]
 
-        x = np.arange(len(classes))
-        width = 0.35
-        plt.figure(figsize=(12, 6))
-        plt.bar(x - width/2, fp_counts, width, label='Falsos Positivos', color='salmon')
-        plt.bar(x + width/2, fn_counts, width, label='Falsos Negativos', color='lightblue')
-        plt.xticks(x, classes, rotation=45, ha='right')
-        plt.xlabel("Clases")
-        plt.ylabel("Cantidad")
-        plt.title("Falsos Positivos y Falsos Negativos por Clase")
-        plt.legend()
-        fp_fn_bar_path = os.path.join(args.base_eval_dir, "fp_fn_bar_chart.png")
-        plt.tight_layout()
-        plt.savefig(fp_fn_bar_path)
-        plt.close()
-        print(f"Gráfica de FP/FN guardada en: {fp_fn_bar_path}")
+            x = np.arange(len(classes))
+            width = 0.35
+            plt.figure(figsize=(12, 6))
+            plt.bar(x - width/2, fp_counts, width, label='Falsos Positivos', color='salmon')
+            plt.bar(x + width/2, fn_counts, width, label='Falsos Negativos', color='lightblue')
+            plt.xticks(x, classes, rotation=45, ha='right')
+            plt.xlabel("Clases")
+            plt.ylabel("Cantidad")
+            plt.title("Falsos Positivos y Falsos Negativos por Clase")
+            plt.legend()
+            fp_fn_bar_path = os.path.join(args.base_eval_dir, "fp_fn_bar_chart.png")
+            plt.tight_layout()
+            plt.savefig(fp_fn_bar_path)
+            plt.close()
+            print(f"Gráfica de FP/FN guardada en: {fp_fn_bar_path}")
 
     if args.coco_eval and COCO_TOOLS_AVAILABLE:
         print("\n--- Evaluación COCO mAP ---")
@@ -1158,26 +1303,28 @@ def evaluate_on_dataset(args, cfg, device):
             print(f"Reporte AP por clase guardado en: {per_class_path}")
 
             # Gráfica de AP por clase
-            plt.figure(figsize=(14, 6))
-            x = np.arange(len(cat_names_list))
-            width = 0.25
+            if PLOTTING_AVAILABLE:
+                # Gráfica de AP por clase
+                plt.figure(figsize=(14, 6))
+                x = np.arange(len(cat_names_list))
+                width = 0.25
 
-            # Colores: rojo para clases minoritarias (detectadas dinámicamente), azul para el resto
-            colors_ap = ['#d62728' if name in minority_classes else '#1f77b4' for name in cat_names_list]
+                # Colores: rojo para clases minoritarias (detectadas dinámicamente), azul para el resto
+                colors_ap = ['#d62728' if name in minority_classes else '#1f77b4' for name in cat_names_list]
 
-            bars1 = plt.bar(x - width, [per_class_ap[n] for n in cat_names_list], width, label='AP@0.5:0.95', color=colors_ap, alpha=0.9)
-            bars2 = plt.bar(x, [per_class_ap50[n] for n in cat_names_list], width, label='AP@0.50', color='#2ca02c', alpha=0.7)
-            bars3 = plt.bar(x + width, [per_class_ap75[n] for n in cat_names_list], width, label='AP@0.75', color='#ff7f0e', alpha=0.7)
+                bars1 = plt.bar(x - width, [per_class_ap[n] for n in cat_names_list], width, label='AP@0.5:0.95', color=colors_ap, alpha=0.9)
+                bars2 = plt.bar(x, [per_class_ap50[n] for n in cat_names_list], width, label='AP@0.50', color='#2ca02c', alpha=0.7)
+                bars3 = plt.bar(x + width, [per_class_ap75[n] for n in cat_names_list], width, label='AP@0.75', color='#ff7f0e', alpha=0.7)
 
-            plt.xticks(x, cat_names_list, rotation=45, ha='right')
-            plt.ylabel('Average Precision (AP)')
-            plt.title('AP por Clase (COCO Metrics)')
-            plt.axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
-            plt.legend(loc='upper right')
-            plt.tight_layout()
-            plt.savefig(os.path.join(args.base_eval_dir, "per_class_ap.png"), dpi=150)
-            plt.close()
-            print(f"Gráfica AP por clase guardada en: {args.base_eval_dir}/per_class_ap.png")
+                plt.xticks(x, cat_names_list, rotation=45, ha='right')
+                plt.ylabel('Average Precision (AP)')
+                plt.title('AP por Clase (COCO Metrics)')
+                plt.axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
+                plt.legend(loc='upper right')
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.base_eval_dir, "per_class_ap.png"), dpi=150)
+                plt.close()
+                print(f"Gráfica AP por clase guardada en: {args.base_eval_dir}/per_class_ap.png")
 
             # --- AP por Tamaño de Objeto (COCO) ---
             # Importante para entender si el modelo falla con objetos pequeños
@@ -1209,36 +1356,37 @@ def evaluate_on_dataset(args, cfg, device):
                 f.write(size_report)
             print(f"Reporte AP por tamaño guardado en: {size_report_path}")
 
-            # Gráfica de AP/AR por tamaño
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            if PLOTTING_AVAILABLE:
+                # Gráfica de AP/AR por tamaño
+                fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-            # AP por tamaño
-            sizes = ['Small\n(<32²)', 'Medium\n(32²-96²)', 'Large\n(>96²)']
-            ap_by_size = [stats[3], stats[4], stats[5]]
-            colors_size = ['#e74c3c' if v < 0.3 else '#f39c12' if v < 0.5 else '#27ae60' for v in ap_by_size]
-            axes[0].bar(sizes, ap_by_size, color=colors_size, edgecolor='black')
-            axes[0].set_ylabel('Average Precision (AP)')
-            axes[0].set_title('AP por Tamaño de Objeto')
-            axes[0].set_ylim(0, 1)
-            axes[0].axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
-            for i, v in enumerate(ap_by_size):
-                axes[0].text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
+                # AP por tamaño
+                sizes = ['Small\n(<32²)', 'Medium\n(32²-96²)', 'Large\n(>96²)']
+                ap_by_size = [stats[3], stats[4], stats[5]]
+                colors_size = ['#e74c3c' if v < 0.3 else '#f39c12' if v < 0.5 else '#27ae60' for v in ap_by_size]
+                axes[0].bar(sizes, ap_by_size, color=colors_size, edgecolor='black')
+                axes[0].set_ylabel('Average Precision (AP)')
+                axes[0].set_title('AP por Tamaño de Objeto')
+                axes[0].set_ylim(0, 1)
+                axes[0].axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
+                for i, v in enumerate(ap_by_size):
+                    axes[0].text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
 
-            # AR por tamaño
-            ar_by_size = [stats[9], stats[10], stats[11]]
-            colors_ar = ['#e74c3c' if v < 0.3 else '#f39c12' if v < 0.5 else '#27ae60' for v in ar_by_size]
-            axes[1].bar(sizes, ar_by_size, color=colors_ar, edgecolor='black')
-            axes[1].set_ylabel('Average Recall (AR)')
-            axes[1].set_title('AR por Tamaño de Objeto')
-            axes[1].set_ylim(0, 1)
-            axes[1].axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
-            for i, v in enumerate(ar_by_size):
-                axes[1].text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
+                # AR por tamaño
+                ar_by_size = [stats[9], stats[10], stats[11]]
+                colors_ar = ['#e74c3c' if v < 0.3 else '#f39c12' if v < 0.5 else '#27ae60' for v in ar_by_size]
+                axes[1].bar(sizes, ar_by_size, color=colors_ar, edgecolor='black')
+                axes[1].set_ylabel('Average Recall (AR)')
+                axes[1].set_title('AR por Tamaño de Objeto')
+                axes[1].set_ylim(0, 1)
+                axes[1].axhline(y=0.5, color='green', linestyle='--', linewidth=1, label='Objetivo: 0.5')
+                for i, v in enumerate(ar_by_size):
+                    axes[1].text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
 
-            plt.tight_layout()
-            plt.savefig(os.path.join(args.base_eval_dir, "ap_ar_by_size.png"), dpi=150)
-            plt.close()
-            print(f"Gráfica AP/AR por tamaño guardada en: {args.base_eval_dir}/ap_ar_by_size.png")
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.base_eval_dir, "ap_ar_by_size.png"), dpi=150)
+                plt.close()
+                print(f"Gráfica AP/AR por tamaño guardada en: {args.base_eval_dir}/ap_ar_by_size.png")
 
             # Diagnóstico de tamaño
             print("\n  Diagnóstico por Tamaño:")
