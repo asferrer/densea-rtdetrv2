@@ -99,7 +99,12 @@ def main(args):
             if self.postprocessor:
                  self.postprocessor.eval()
 
-            # 2. Replace FrozenBatchNorm2d before attempting fusion
+            # 2. Call model.deploy() to fuse RepVggBlock parallel branches (3x3+1x1 → single 3x3)
+            if hasattr(self.model, 'deploy'):
+                logging.info("Calling model.deploy() to fuse RepVggBlock branches...")
+                self.model.deploy()
+
+            # 3. Replace FrozenBatchNorm2d before attempting fusion
             logging.info("Replacing FrozenBatchNorm2d layers with standard nn.BatchNorm2d in eval mode...")
             self.model = replace_frozen_bn_with_bn(self.model)
 
@@ -235,7 +240,7 @@ def main(args):
     input_shape = (batch_size, 3, args.input_height, args.input_width)
     dummy_images = torch.randn(input_shape, dtype=torch.float32)
     # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
-    dummy_orig_sizes = torch.tensor([[args.input_width, args.input_height]] * batch_size, dtype=torch.int64)
+    dummy_orig_sizes = torch.tensor([[args.input_width, args.input_height]] * batch_size, dtype=torch.int32)
     logging.info(f"Dummy input shape (images): {dummy_images.shape}")
     logging.info(f"Dummy input (orig_target_sizes): {dummy_orig_sizes.shape}, dtype={dummy_orig_sizes.dtype}")
 
@@ -243,10 +248,11 @@ def main(args):
     output_onnx_file = args.output_file
     input_names = ['images', 'orig_target_sizes']
     output_names = ['labels', 'boxes', 'scores'] # Adjust if your model outputs differ
-    dynamic_axes = {
+    # Static shapes for Jetson deployment (batch=1 fixed).
+    # TensorRT optimizes better with fully static shapes.
+    dynamic_axes = None if getattr(args, 'static_batch', False) else {
         input_names[0]: {0: 'N'},
         input_names[1]: {0: 'N'},
-        # Add dynamic axes for outputs if needed
     }
 
     # Opset version: Defaulting to 17 for better compatibility with PyTorch 2.5 & TRT 10.x
@@ -339,6 +345,7 @@ if __name__ == '__main__':
     parser.add_argument('--opset', type=int, default=17, help='ONNX opset version (e.g., 13, 16, 17). Check TensorRT compatibility.')
     # Argument to enable/disable fusion
     parser.add_argument('--fuse-layers', action='store_true', help='Attempt to fuse Conv+BN layers before exporting.')
+    parser.add_argument('--static-batch', action='store_true', help='Export with static batch size (recommended for Jetson/TensorRT).')
 
     args = parser.parse_args()
 

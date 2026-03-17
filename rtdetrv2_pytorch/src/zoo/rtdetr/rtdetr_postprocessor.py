@@ -55,9 +55,7 @@ class RTDETRPostProcessor(nn.Module):
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
             scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
-            # TODO for older tensorrt
-            # labels = index % self.num_classes
-            labels = mod(index, self.num_classes)
+            labels = index % self.num_classes
             index = index // self.num_classes
             boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
             
@@ -71,7 +69,7 @@ class RTDETRPostProcessor(nn.Module):
         
         # TODO for onnx export
         if self.deploy_mode:
-            return labels, boxes, scores
+            return labels.int(), boxes, scores
 
         # TODO
         if self.remap_mscoco_category:
