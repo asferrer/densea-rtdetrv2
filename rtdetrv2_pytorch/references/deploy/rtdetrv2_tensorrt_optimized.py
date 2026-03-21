@@ -34,8 +34,7 @@ import argparse
 import cv2
 import numpy as np
 import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
+import torch
 import time
 import json
 import io
@@ -80,12 +79,32 @@ WARMUP_RUNS = 50
 
 
 class TRTInferenceEngine:
-    """High-performance TensorRT inference with CUDA graphs and pinned memory."""
+    """High-performance TensorRT inference with CUDA graphs and PyTorch CUDA streams.
+
+    Uses torch.cuda instead of PyCUDA for full compatibility with TensorRT 10.x
+    auxiliary streams on Jetson platforms.
+    """
+
+    # Map TRT dtypes to torch dtypes (populated lazily)
+    _TRT_TO_TORCH = None
+
+    @staticmethod
+    def _trt_dtype_to_torch(trt_dtype):
+        if TRTInferenceEngine._TRT_TO_TORCH is None:
+            TRTInferenceEngine._TRT_TO_TORCH = {
+                trt.float32: torch.float32,
+                trt.float16: torch.float16,
+                trt.int32: torch.int32,
+                trt.int64: torch.int64,
+                trt.int8: torch.int8,
+                trt.bool: torch.bool,
+            }
+        return TRTInferenceEngine._TRT_TO_TORCH.get(trt_dtype, torch.float32)
 
     def __init__(self, engine_path: str, use_cuda_graph: bool = True):
         self.use_cuda_graph = use_cuda_graph
-        self._graph = None
-        self._graph_exec = None
+        self._cuda_graph = None
+        self.device = torch.device('cuda')
 
         # Load engine
         with open(engine_path, "rb") as f:
@@ -96,10 +115,10 @@ class TRTInferenceEngine:
 
         self.context = self.engine.create_execution_context()
 
-        # Create stream and events for GPU timing
-        self.stream = cuda.Stream()
-        self.event_start = cuda.Event()
-        self.event_end = cuda.Event()
+        # PyTorch CUDA stream and events for GPU timing
+        self.stream = torch.cuda.Stream(device=self.device)
+        self.event_start = torch.cuda.Event(enable_timing=True)
+        self.event_end = torch.cuda.Event(enable_timing=True)
 
         # Resolve buffer layout once
         self._setup_buffers()
@@ -110,17 +129,18 @@ class TRTInferenceEngine:
 
         # Set tensor addresses once
         for buf in self._all_buffers:
-            self.context.set_tensor_address(buf['name'], buf['device'])
+            self.context.set_tensor_address(buf['name'], buf['tensor'].data_ptr())
 
     def _setup_buffers(self):
-        """Pre-allocate all pinned host and device buffers."""
+        """Pre-allocate all GPU buffers as contiguous torch tensors."""
         self._inputs = {}
         self._outputs = {}
         self._all_buffers = []
 
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            torch_dtype = self._trt_dtype_to_torch(trt_dtype)
             mode = self.engine.get_tensor_mode(name)
 
             # Determine shape
@@ -135,16 +155,13 @@ class TRTInferenceEngine:
             else:
                 shape = tuple(self.engine.get_tensor_shape(name))
 
-            size = int(np.prod(shape))
-            host_mem = cuda.pagelocked_empty(size, dtype=dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            tensor = torch.empty(shape, dtype=torch_dtype, device=self.device).contiguous()
 
             buf = {
                 'name': name,
-                'host': host_mem,
-                'device': device_mem,
+                'tensor': tensor,
                 'shape': shape,
-                'dtype': dtype,
+                'dtype': torch_dtype,
             }
             self._all_buffers.append(buf)
 
@@ -155,8 +172,8 @@ class TRTInferenceEngine:
 
     def warmup(self, n: int = WARMUP_RUNS):
         """Run warmup inferences to stabilize GPU clocks and JIT."""
-        dummy_img = np.zeros((1, 3, INPUT_H, INPUT_W), dtype=np.float32)
-        dummy_sizes = np.array([[INPUT_W, INPUT_H]], dtype=np.int64)
+        dummy_img = torch.zeros((1, 3, INPUT_H, INPUT_W), dtype=torch.float32, device=self.device)
+        dummy_sizes = torch.tensor([[INPUT_W, INPUT_H]], dtype=torch.int32, device=self.device)
 
         for _ in range(n):
             self._execute(dummy_img, dummy_sizes)
@@ -165,111 +182,99 @@ class TRTInferenceEngine:
         if self.use_cuda_graph:
             self._capture_cuda_graph(dummy_img, dummy_sizes)
 
-    def _execute(self, images: np.ndarray, orig_sizes: np.ndarray):
+    def _execute(self, images: torch.Tensor, orig_sizes: torch.Tensor):
         """Raw execution without CUDA graph."""
-        img_buf = self._inputs["images"]
-        size_buf = self._inputs["orig_target_sizes"]
-
-        np.copyto(img_buf['host'], images.ravel())
-        np.copyto(size_buf['host'], orig_sizes.ravel())
-
-        cuda.memcpy_htod_async(img_buf['device'], img_buf['host'], self.stream)
-        cuda.memcpy_htod_async(
-            size_buf['device'], size_buf['host'], self.stream
-        )
-
-        self.context.execute_async_v3(stream_handle=self.stream.handle)
-
-        for buf in self._outputs.values():
-            cuda.memcpy_dtoh_async(buf['host'], buf['device'], self.stream)
-
+        with torch.cuda.stream(self.stream):
+            self._inputs["images"]['tensor'].copy_(images)
+            self._inputs["orig_target_sizes"]['tensor'].copy_(
+                orig_sizes.to(self._inputs["orig_target_sizes"]['dtype'])
+            )
+            self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
         self.stream.synchronize()
 
     def _capture_cuda_graph(
-        self, images: np.ndarray, orig_sizes: np.ndarray
+        self, images: torch.Tensor, orig_sizes: torch.Tensor
     ):
         """Capture CUDA graph for zero kernel-launch overhead."""
         try:
-            img_buf = self._inputs["images"]
-            size_buf = self._inputs["orig_target_sizes"]
-
-            np.copyto(img_buf['host'], images.ravel())
-            np.copyto(size_buf['host'], orig_sizes.ravel())
-            cuda.memcpy_htod_async(
-                img_buf['device'], img_buf['host'], self.stream
-            )
-            cuda.memcpy_htod_async(
-                size_buf['device'], size_buf['host'], self.stream
-            )
+            # Pre-copy inputs (addresses must be stable for graph capture)
+            with torch.cuda.stream(self.stream):
+                self._inputs["images"]['tensor'].copy_(images)
+                self._inputs["orig_target_sizes"]['tensor'].copy_(
+                    orig_sizes.to(self._inputs["orig_target_sizes"]['dtype'])
+                )
             self.stream.synchronize()
 
-            self._graph = cuda.Graph()
-            self.stream.begin_capture()
-            self.context.execute_async_v3(stream_handle=self.stream.handle)
-            self._graph = self.stream.end_capture()
-            self._graph_exec = self._graph.instantiate()
+            # Capture only the execution kernel(s)
+            self._cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(self.stream):
+                with torch.cuda.graph(self._cuda_graph, stream=self.stream):
+                    self.context.execute_async_v3(
+                        stream_handle=self.stream.cuda_stream
+                    )
+
             print(
                 "[OPT] CUDA graph captured — kernel launch overhead eliminated"
             )
         except Exception as e:
             print(f"[OPT] CUDA graph capture failed ({e}), using standard execution")
-            self._graph = None
-            self._graph_exec = None
+            self._cuda_graph = None
 
     def infer(
         self,
-        images: np.ndarray,
-        orig_sizes: np.ndarray,
+        images_np: np.ndarray,
+        orig_sizes_np: np.ndarray,
         measure_gpu_time: bool = False,
     ) -> dict:
         """
         Run inference with optional GPU-side timing.
 
+        Args:
+            images_np: numpy array (1, 3, H, W) float32
+            orig_sizes_np: numpy array (1, 2) int32 [W, H]
+            measure_gpu_time: if True, returns 'gpu_time_ms' in results
+
         Returns dict with 'labels', 'boxes', 'scores' numpy arrays.
-        If measure_gpu_time=True, also returns 'gpu_time_ms'.
         """
         img_buf = self._inputs["images"]
         size_buf = self._inputs["orig_target_sizes"]
 
-        # Copy input data to pinned host buffers
-        np.copyto(img_buf['host'], images.ravel())
-        np.copyto(size_buf['host'], orig_sizes.ravel())
-
-        # H2D transfers
-        cuda.memcpy_htod_async(img_buf['device'], img_buf['host'], self.stream)
-        cuda.memcpy_htod_async(
-            size_buf['device'], size_buf['host'], self.stream
+        # Copy input data to GPU tensors
+        images_t = torch.from_numpy(images_np).to(self.device)
+        sizes_t = torch.from_numpy(orig_sizes_np).to(
+            dtype=size_buf['dtype'], device=self.device
         )
 
-        # GPU timing start
-        if measure_gpu_time:
-            self.event_start.record(self.stream)
+        with torch.cuda.stream(self.stream):
+            img_buf['tensor'].copy_(images_t)
+            size_buf['tensor'].copy_(sizes_t)
 
-        # Execute (CUDA graph or standard)
-        if self._graph_exec is not None:
-            self._graph_exec.launch(self.stream)
-        else:
-            self.context.execute_async_v3(stream_handle=self.stream.handle)
+            # GPU timing start
+            if measure_gpu_time:
+                self.event_start.record(self.stream)
 
-        # GPU timing end
-        if measure_gpu_time:
-            self.event_end.record(self.stream)
+            # Execute (CUDA graph or standard)
+            if self._cuda_graph is not None:
+                self._cuda_graph.replay()
+            else:
+                self.context.execute_async_v3(
+                    stream_handle=self.stream.cuda_stream
+                )
 
-        # D2H transfers
-        for buf in self._outputs.values():
-            cuda.memcpy_dtoh_async(buf['host'], buf['device'], self.stream)
+            # GPU timing end
+            if measure_gpu_time:
+                self.event_end.record(self.stream)
 
         self.stream.synchronize()
 
-        # Build results
+        # Build results (copy from GPU to numpy)
         results = {}
         for name, buf in self._outputs.items():
             out_shape = self.context.get_tensor_shape(name)
-            expected = int(np.prod(out_shape))
-            results[name] = buf['host'][:expected].reshape(out_shape)
+            results[name] = buf['tensor'].cpu().numpy().reshape(out_shape)
 
         if measure_gpu_time:
-            results['gpu_time_ms'] = self.event_start.time_till(
+            results['gpu_time_ms'] = self.event_start.elapsed_time(
                 self.event_end
             )
 
@@ -437,7 +442,7 @@ def run_evaluation(args, engine: TRTInferenceEngine):
         # Preprocess
         img_batch = preprocess_cpu(frame)
         orig_sizes = np.array(
-            [[frame.shape[1], frame.shape[0]]], dtype=np.int64
+            [[frame.shape[1], frame.shape[0]]], dtype=np.int32
         )
 
         # Inference with wall-clock and GPU timing
@@ -521,7 +526,7 @@ def run_evaluation(args, engine: TRTInferenceEngine):
         "engine_file": args.engine_file,
         "total_images": len(wall_times),
         "cuda_graph_enabled": engine.use_cuda_graph
-                              and engine._graph_exec is not None,
+                              and engine._cuda_graph is not None,
         "warmup_runs": WARMUP_RUNS,
         "wall_time_ms": {
             "mean": float(np.mean(wall_arr)),
@@ -662,7 +667,7 @@ def run_inference(args, engine: TRTInferenceEngine):
     if os.path.isfile(src) and src.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
         frame = cv2.imread(src)
         img_batch = preprocess_cpu(frame)
-        orig_sizes = np.array([[frame.shape[1], frame.shape[0]]], dtype=np.int64)
+        orig_sizes = np.array([[frame.shape[1], frame.shape[0]]], dtype=np.int32)
         results = engine.infer(img_batch, orig_sizes)
 
         labels = results.get('labels', np.array([]))[0]
@@ -691,7 +696,7 @@ def run_inference(args, engine: TRTInferenceEngine):
                 continue
             img_batch = preprocess_cpu(frame)
             orig_sizes = np.array(
-                [[frame.shape[1], frame.shape[0]]], dtype=np.int64
+                [[frame.shape[1], frame.shape[0]]], dtype=np.int32
             )
             results = engine.infer(img_batch, orig_sizes)
             labels = results.get('labels', np.array([]))[0]
@@ -730,7 +735,7 @@ def run_inference(args, engine: TRTInferenceEngine):
                 break
             img_batch = preprocess_cpu(frame)
             orig_sizes = np.array(
-                [[frame.shape[1], frame.shape[0]]], dtype=np.int64
+                [[frame.shape[1], frame.shape[0]]], dtype=np.int32
             )
             results = engine.infer(img_batch, orig_sizes)
             labels = results.get('labels', np.array([]))[0]
