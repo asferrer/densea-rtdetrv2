@@ -41,12 +41,17 @@ ENGINE_PREFIX="rtdetrv2_r50vd_densea_exp06"
 ONNX_RAW="../${ENGINE_PREFIX}.onnx"
 ONNX_OUTPUT="../${ENGINE_PREFIX}_simplified.onnx"
 EVAL_DIR="eval_results"
+EVAL_OPT_DIR="eval_results_optimized"
 CONDA_ENV="densea_env"
 WORKSPACE_MB=2048
 OPT_LEVEL=5
 INT8_CALIB_IMAGES=100
 TIMING_CACHE="timing_cache.bin"
 CALIB_DIR="calibration_set"
+
+# Dataset paths (para evaluacion optimizada)
+EVAL_JSON="split_v8/test.json"
+EVAL_IMG_DIR="dataset/test_images"
 
 # Fichero de log con timestamp — captura TODA la salida (stdout + stderr)
 LOGFILE="/home/saflex/Desktop/RT-DETRv2-Densea/eval_run_$(date +%Y%m%d_%H%M%S).log"
@@ -81,11 +86,58 @@ check_file() {
     fi
 }
 
+# Pregunta interactiva: si el fichero existe, da opcion de saltar o regenerar.
+# Uso: ask_skip "descripcion" fichero1 [fichero2 ...]
+# Retorna 0 si se debe SALTAR (ficheros existen y usuario quiere reutilizar),
+# retorna 1 si se debe EJECUTAR (ficheros no existen o usuario quiere regenerar).
+ask_skip() {
+    local description="$1"
+    shift
+    local all_exist=true
+    for f in "$@"; do
+        if [ ! -f "$f" ]; then
+            all_exist=false
+            break
+        fi
+    done
+
+    if [ "$all_exist" = false ]; then
+        return 1  # Ejecutar: algun fichero no existe
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Los siguientes ficheros ya existen para '${description}':${NC}"
+    for f in "$@"; do
+        echo "  - $f ($(ls -lh "$f" 2>/dev/null | awk '{print $5}'))"
+    done
+    echo ""
+    echo -n -e "${YELLOW}Reutilizar ficheros existentes? [S/n] (auto-SI en 15s): ${NC}"
+
+    local answer
+    if read -t 15 -r answer; then
+        case "$answer" in
+            [nN]|[nN][oO])
+                echo "Regenerando..."
+                for f in "$@"; do rm -f "$f"; done
+                return 1  # Ejecutar
+                ;;
+            *)
+                echo "Reutilizando ficheros existentes, saltando fase."
+                return 0  # Saltar
+                ;;
+        esac
+    else
+        echo ""
+        echo "Timeout — reutilizando ficheros existentes."
+        return 0  # Saltar
+    fi
+}
+
 # ============================================================================
 # PASO 0: PREPARACION DEL SISTEMA
 # ============================================================================
 
-log_step "PASO 0/8: Preparacion del sistema — liberando memoria maxima"
+log_step "PASO 0/9: Preparacion del sistema — liberando memoria maxima"
 
 # Matar procesos pesados no esenciales para liberar RAM
 echo "Matando procesos pesados (VSCode, node, snap, tracker, etc.)..."
@@ -116,127 +168,124 @@ echo ""
 echo "Objetivo: >5GB libres para builds TensorRT"
 
 # ============================================================================
-# PASO 1: LIMPIAR ARTEFACTOS ANTERIORES
+# PASO 1: EXPORTAR ONNX
 # ============================================================================
-
-log_step "PASO 1/8: Limpieza de artefactos anteriores"
 
 cd "$WORKDIR"
 
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_fp32.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_fp16.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_fp32_bs1.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_fp16_bs1.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_int8.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_int8_bs1.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_int8_entropy.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_int8_minmax.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_int8_classic.engine"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_simplified.onnx"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_simplified_int8.onnx"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}_simplified_named.onnx"
-rm -f "${ENGINE_DIR}/${ENGINE_PREFIX}.onnx"
-rm -f "${ENGINE_DIR}/calib_entropy.cache" "${ENGINE_DIR}/calib_minmax.cache"
-rm -f calibration.cache
-rm -f ../model.onnx
-rm -f model.onnx model_simplified.onnx
-rm -rf "${EVAL_DIR}"
+log_step "PASO 1/9: Exportar ONNX (RepVgg fusion + Int32 + static batch)"
 
-log_ok "Limpieza completada"
+if ask_skip "ONNX export" "$ONNX_RAW" "$ONNX_OUTPUT"; then
+    log_ok "ONNX export saltado (ficheros existentes)"
+else
+    run_python tools/export_onnx.py \
+        -c "$CONFIG" \
+        -r "$CHECKPOINT" \
+        -o "$ONNX_RAW" \
+        --static-batch \
+        --fuse-layers \
+        --simplify \
+        --check
+
+    echo ""
+    check_file "$ONNX_RAW"
+    check_file "$ONNX_OUTPUT" || exit 1
+fi
 
 # ============================================================================
-# PASO 2: EXPORTAR ONNX
+# PASO 2: BUILD TENSORRT FP32
 # ============================================================================
-
-log_step "PASO 2/8: Exportar ONNX (RepVgg fusion + Int32 + static batch)"
-
-run_python tools/export_onnx.py \
-    -c "$CONFIG" \
-    -r "$CHECKPOINT" \
-    -o "$ONNX_RAW" \
-    --static-batch \
-    --fuse-layers \
-    --simplify \
-    --check
-
-echo ""
-check_file "$ONNX_RAW"
-check_file "$ONNX_OUTPUT" || exit 1
-
-# ============================================================================
-# PASO 3: BUILD TENSORRT FP32
-# ============================================================================
-
-log_step "PASO 3/8: Build TensorRT FP32"
-drop_caches
 
 FP32_ENGINE="${ENGINE_DIR}/${ENGINE_PREFIX}_fp32.engine"
-run_python references/deploy/build_engine.py \
-    --onnx "$ONNX_OUTPUT" \
-    --output "$FP32_ENGINE" \
-    --workspace_mb "$WORKSPACE_MB" \
-    --opt_level "$OPT_LEVEL" \
-    --timing_cache "$TIMING_CACHE"
 
-check_file "$FP32_ENGINE"
+log_step "PASO 2/9: Build TensorRT FP32"
+
+if ask_skip "TensorRT FP32 engine" "$FP32_ENGINE"; then
+    log_ok "Build FP32 saltado (engine existente)"
+else
+    drop_caches
+    run_python references/deploy/build_engine.py \
+        --onnx "$ONNX_OUTPUT" \
+        --output "$FP32_ENGINE" \
+        --workspace_mb "$WORKSPACE_MB" \
+        --opt_level "$OPT_LEVEL" \
+        --timing_cache "$TIMING_CACHE"
+
+    check_file "$FP32_ENGINE"
+fi
 
 # ============================================================================
-# PASO 4: BUILD TENSORRT FP16
+# PASO 3: BUILD TENSORRT FP16
 # ============================================================================
-
-log_step "PASO 4/8: Build TensorRT FP16"
-drop_caches
 
 FP16_ENGINE="${ENGINE_DIR}/${ENGINE_PREFIX}_fp16.engine"
-run_python references/deploy/build_engine.py \
-    --onnx "$ONNX_OUTPUT" \
-    --output "$FP16_ENGINE" \
-    --fp16 \
-    --workspace_mb "$WORKSPACE_MB" \
-    --opt_level "$OPT_LEVEL" \
-    --timing_cache "$TIMING_CACHE"
 
-check_file "$FP16_ENGINE"
+log_step "PASO 3/9: Build TensorRT FP16"
+
+if ask_skip "TensorRT FP16 engine" "$FP16_ENGINE"; then
+    log_ok "Build FP16 saltado (engine existente)"
+else
+    drop_caches
+    run_python references/deploy/build_engine.py \
+        --onnx "$ONNX_OUTPUT" \
+        --output "$FP16_ENGINE" \
+        --fp16 \
+        --workspace_mb "$WORKSPACE_MB" \
+        --opt_level "$OPT_LEVEL" \
+        --timing_cache "$TIMING_CACHE"
+
+    check_file "$FP16_ENGINE"
+fi
 
 # ============================================================================
-# PASO 5: BUILD TENSORRT INT8 (entropy) — nvidia-modelopt explicit Q/DQ
+# PASO 4: BUILD TENSORRT INT8 (entropy) — nvidia-modelopt explicit Q/DQ
 # ============================================================================
-
-log_step "PASO 5/8: Build TensorRT INT8 (entropy, modelopt Q/DQ)"
-drop_caches
 
 INT8_ENTROPY_ENGINE="${ENGINE_DIR}/${ENGINE_PREFIX}_int8_entropy.engine"
-run_python references/deploy/build_int8_engine.py \
-    --onnx "$ONNX_OUTPUT" \
-    --output "$INT8_ENTROPY_ENGINE" \
-    --calib_dir "$CALIB_DIR" \
-    --max_images "$INT8_CALIB_IMAGES" \
-    --calibrate_method entropy \
-    --workspace "$WORKSPACE_MB" \
-    --opt_level 3 \
-    --timing_cache "$TIMING_CACHE" || log_warn "Build INT8 entropy fallo, continuando..."
 
-check_file "$INT8_ENTROPY_ENGINE" || true
+log_step "PASO 4/9: Build TensorRT INT8 (entropy, modelopt Q/DQ)"
+
+if ask_skip "TensorRT INT8 entropy engine" "$INT8_ENTROPY_ENGINE"; then
+    log_ok "Build INT8 entropy saltado (engine existente)"
+else
+    drop_caches
+    run_python references/deploy/build_int8_engine.py \
+        --onnx "$ONNX_OUTPUT" \
+        --output "$INT8_ENTROPY_ENGINE" \
+        --calib_dir "$CALIB_DIR" \
+        --max_images "$INT8_CALIB_IMAGES" \
+        --calibrate_method entropy \
+        --workspace "$WORKSPACE_MB" \
+        --opt_level 3 \
+        --timing_cache "$TIMING_CACHE" || log_warn "Build INT8 entropy fallo, continuando..."
+
+    check_file "$INT8_ENTROPY_ENGINE" || true
+fi
 
 # ============================================================================
-# PASO 6: BUILD TENSORRT INT8 (minmax) — nvidia-modelopt explicit Q/DQ
+# PASO 5: BUILD TENSORRT INT8 (minmax) — nvidia-modelopt explicit Q/DQ
 # ============================================================================
-
-log_step "PASO 6/8: Build TensorRT INT8 (minmax, modelopt Q/DQ)"
-drop_caches
 
 INT8_MINMAX_ENGINE="${ENGINE_DIR}/${ENGINE_PREFIX}_int8_minmax.engine"
-run_python references/deploy/build_int8_engine.py \
-    --onnx "$ONNX_OUTPUT" \
-    --output "$INT8_MINMAX_ENGINE" \
-    --calib_dir "$CALIB_DIR" \
-    --max_images "$INT8_CALIB_IMAGES" \
-    --calibrate_method minmax \
-    --workspace "$WORKSPACE_MB" \
-    --opt_level 3 \
-    --timing_cache "$TIMING_CACHE" || log_warn "Build INT8 minmax fallo, continuando..."
 
-check_file "$INT8_MINMAX_ENGINE" || true
+log_step "PASO 5/9: Build TensorRT INT8 (minmax, modelopt Q/DQ)"
+
+if ask_skip "TensorRT INT8 minmax engine" "$INT8_MINMAX_ENGINE"; then
+    log_ok "Build INT8 minmax saltado (engine existente)"
+else
+    drop_caches
+    run_python references/deploy/build_int8_engine.py \
+        --onnx "$ONNX_OUTPUT" \
+        --output "$INT8_MINMAX_ENGINE" \
+        --calib_dir "$CALIB_DIR" \
+        --max_images "$INT8_CALIB_IMAGES" \
+        --calibrate_method minmax \
+        --workspace "$WORKSPACE_MB" \
+        --opt_level 3 \
+        --timing_cache "$TIMING_CACHE" || log_warn "Build INT8 minmax fallo, continuando..."
+
+    check_file "$INT8_MINMAX_ENGINE" || true
+fi
 
 # ============================================================================
 # RESUMEN DE BUILDS
@@ -248,66 +297,153 @@ ls -lhS "${ENGINE_DIR}/${ENGINE_PREFIX}"*.engine "${ENGINE_DIR}/${ENGINE_PREFIX}
 echo ""
 
 # ============================================================================
-# PASO 7: EVALUACIONES (5 modelos)
+# PASO 6: EVALUACIONES ESTANDAR (5 modelos con eval.py)
 # ============================================================================
 
 EVAL_FAILED=0
 
 # --- EVAL 1: ONNX ---
-log_step "PASO 7/8: Evaluacion ONNX (1/5)"
-drop_caches
-if run_python tools/eval.py -c "$CONFIG" --onnx "$ONNX_OUTPUT" -d cuda --output_dir "${EVAL_DIR}/onnx"; then
-    log_ok "Evaluacion ONNX completada"
+log_step "PASO 6/9: Evaluacion ONNX (1/5)"
+
+if ask_skip "Evaluacion ONNX" "${EVAL_DIR}/onnx/evaluation_summary.txt"; then
+    log_ok "Evaluacion ONNX saltada (resultados existentes)"
 else
-    log_fail "Evaluacion ONNX fallo"
-    EVAL_FAILED=$((EVAL_FAILED + 1))
+    drop_caches
+    if run_python tools/eval.py -c "$CONFIG" --onnx "$ONNX_OUTPUT" -d cuda --output_dir "${EVAL_DIR}/onnx"; then
+        log_ok "Evaluacion ONNX completada"
+    else
+        log_fail "Evaluacion ONNX fallo"
+        EVAL_FAILED=$((EVAL_FAILED + 1))
+    fi
 fi
 
 # --- EVAL 2: TensorRT FP32 ---
 log_step "Evaluacion TensorRT FP32 (2/5)"
-drop_caches
-if [ -f "$FP32_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$FP32_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_fp32"; then
-    log_ok "Evaluacion TRT FP32 completada"
+
+if ask_skip "Evaluacion TRT FP32" "${EVAL_DIR}/trt_fp32/evaluation_summary.txt"; then
+    log_ok "Evaluacion TRT FP32 saltada (resultados existentes)"
 else
-    log_warn "Evaluacion TRT FP32 saltada o fallo"
-    EVAL_FAILED=$((EVAL_FAILED + 1))
+    drop_caches
+    if [ -f "$FP32_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$FP32_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_fp32"; then
+        log_ok "Evaluacion TRT FP32 completada"
+    else
+        log_warn "Evaluacion TRT FP32 saltada o fallo"
+        EVAL_FAILED=$((EVAL_FAILED + 1))
+    fi
 fi
 
 # --- EVAL 3: TensorRT FP16 ---
 log_step "Evaluacion TensorRT FP16 (3/5)"
-drop_caches
-if [ -f "$FP16_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$FP16_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_fp16"; then
-    log_ok "Evaluacion TRT FP16 completada"
+
+if ask_skip "Evaluacion TRT FP16" "${EVAL_DIR}/trt_fp16/evaluation_summary.txt"; then
+    log_ok "Evaluacion TRT FP16 saltada (resultados existentes)"
 else
-    log_warn "Evaluacion TRT FP16 saltada o fallo"
-    EVAL_FAILED=$((EVAL_FAILED + 1))
+    drop_caches
+    if [ -f "$FP16_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$FP16_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_fp16"; then
+        log_ok "Evaluacion TRT FP16 completada"
+    else
+        log_warn "Evaluacion TRT FP16 saltada o fallo"
+        EVAL_FAILED=$((EVAL_FAILED + 1))
+    fi
 fi
 
 # --- EVAL 4: TensorRT INT8 entropy ---
 log_step "Evaluacion TensorRT INT8 entropy (4/5)"
-drop_caches
-if [ -f "$INT8_ENTROPY_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$INT8_ENTROPY_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_int8_entropy"; then
-    log_ok "Evaluacion TRT INT8 entropy completada"
+
+if ask_skip "Evaluacion TRT INT8 entropy" "${EVAL_DIR}/trt_int8_entropy/evaluation_summary.txt"; then
+    log_ok "Evaluacion TRT INT8 entropy saltada (resultados existentes)"
 else
-    log_warn "Evaluacion TRT INT8 entropy saltada o fallo"
-    EVAL_FAILED=$((EVAL_FAILED + 1))
+    drop_caches
+    if [ -f "$INT8_ENTROPY_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$INT8_ENTROPY_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_int8_entropy"; then
+        log_ok "Evaluacion TRT INT8 entropy completada"
+    else
+        log_warn "Evaluacion TRT INT8 entropy saltada o fallo"
+        EVAL_FAILED=$((EVAL_FAILED + 1))
+    fi
 fi
 
 # --- EVAL 5: TensorRT INT8 minmax ---
 log_step "Evaluacion TensorRT INT8 minmax (5/5)"
-drop_caches
-if [ -f "$INT8_MINMAX_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$INT8_MINMAX_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_int8_minmax"; then
-    log_ok "Evaluacion TRT INT8 minmax completada"
+
+if ask_skip "Evaluacion TRT INT8 minmax" "${EVAL_DIR}/trt_int8_minmax/evaluation_summary.txt"; then
+    log_ok "Evaluacion TRT INT8 minmax saltada (resultados existentes)"
 else
-    log_warn "Evaluacion TRT INT8 minmax saltada o fallo"
-    EVAL_FAILED=$((EVAL_FAILED + 1))
+    drop_caches
+    if [ -f "$INT8_MINMAX_ENGINE" ] && run_python tools/eval.py -c "$CONFIG" --tensorrt "$INT8_MINMAX_ENGINE" -d cuda --output_dir "${EVAL_DIR}/trt_int8_minmax"; then
+        log_ok "Evaluacion TRT INT8 minmax completada"
+    else
+        log_warn "Evaluacion TRT INT8 minmax saltada o fallo"
+        EVAL_FAILED=$((EVAL_FAILED + 1))
+    fi
+fi
+
+# ============================================================================
+# PASO 7: EVALUACIONES OPTIMIZADAS (CUDA graphs + GPU timing + power)
+# ============================================================================
+
+log_step "PASO 7/9: Evaluaciones optimizadas — CUDA graphs, latencia GPU, consumo"
+
+OPTIMIZED_SCRIPT="references/deploy/rtdetrv2_tensorrt_optimized.py"
+
+# Verificar que existen los ficheros necesarios
+if [ ! -f "$OPTIMIZED_SCRIPT" ]; then
+    log_warn "Script optimizado no encontrado: $OPTIMIZED_SCRIPT — saltando"
+elif [ ! -f "$EVAL_JSON" ]; then
+    log_warn "Anotaciones no encontradas: $EVAL_JSON — saltando evaluaciones optimizadas"
+elif [ ! -d "$EVAL_IMG_DIR" ]; then
+    log_warn "Directorio de imagenes no encontrado: $EVAL_IMG_DIR — saltando evaluaciones optimizadas"
+else
+    # Lista de engines a evaluar: nombre_corto engine_path
+    declare -a OPT_ENGINES=(
+        "trt_fp32:${FP32_ENGINE}"
+        "trt_fp16:${FP16_ENGINE}"
+        "trt_int8_entropy:${INT8_ENTROPY_ENGINE}"
+        "trt_int8_minmax:${INT8_MINMAX_ENGINE}"
+    )
+
+    OPT_IDX=0
+    OPT_TOTAL=${#OPT_ENGINES[@]}
+
+    for entry in "${OPT_ENGINES[@]}"; do
+        OPT_IDX=$((OPT_IDX + 1))
+        name="${entry%%:*}"
+        engine_path="${entry#*:}"
+        out_dir="${EVAL_OPT_DIR}/${name}"
+
+        echo ""
+        echo -e "${CYAN}--- Evaluacion optimizada ${OPT_IDX}/${OPT_TOTAL}: ${name} ---${NC}"
+
+        if [ ! -f "$engine_path" ]; then
+            log_warn "Engine no existe: $engine_path — saltando $name"
+            continue
+        fi
+
+        if ask_skip "Evaluacion optimizada ${name}" "${out_dir}/performance_stats.json"; then
+            log_ok "Evaluacion optimizada ${name} saltada (resultados existentes)"
+            continue
+        fi
+
+        drop_caches
+
+        if run_python "$OPTIMIZED_SCRIPT" \
+            --engine_file "$engine_path" \
+            --eval_json "$EVAL_JSON" \
+            --eval_root_dir "$EVAL_IMG_DIR" \
+            --output_dir "$out_dir" \
+            --threshold 0.001; then
+            log_ok "Evaluacion optimizada ${name} completada"
+        else
+            log_warn "Evaluacion optimizada ${name} fallo"
+            EVAL_FAILED=$((EVAL_FAILED + 1))
+        fi
+    done
 fi
 
 # ============================================================================
 # PASO 8: RESUMEN COMPARATIVO
 # ============================================================================
 
-log_step "PASO 8/8: Resumen comparativo"
+log_step "PASO 8/9: Resumen comparativo — Evaluacion estandar"
 
 # Header
 echo ""
@@ -334,8 +470,50 @@ for d in "${EVAL_DIR}"/*/; do
     printf "%-22s  %-10s  %-12s\n" "$name" "${sz:--}" "${map:--}"
 done
 
+# ============================================================================
+# PASO 9: RESUMEN RENDIMIENTO OPTIMIZADO
+# ============================================================================
+
+log_step "PASO 9/9: Resumen rendimiento optimizado (CUDA graphs + GPU timing)"
+
 echo ""
-echo "Resultados detallados en: ${WORKDIR}/${EVAL_DIR}/*/"
+printf "%-22s  %-10s  %-10s  %-10s  %-10s  %-10s  %-10s\n" \
+    "MODELO" "mAP" "FPS(wall)" "FPS(GPU)" "Lat.p95" "Lat.p99" "Power(W)"
+printf "%-22s  %-10s  %-10s  %-10s  %-10s  %-10s  %-10s\n" \
+    "----------------------" "----------" "----------" "----------" "----------" "----------" "----------"
+
+for d in "${EVAL_OPT_DIR}"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    json_file="${d}performance_stats.json"
+
+    if [ ! -f "$json_file" ]; then
+        printf "%-22s  %-10s\n" "$name" "(sin datos)"
+        continue
+    fi
+
+    # Extraer metricas del JSON con python
+    read -r ap fps_wall fps_gpu p95 p99 power <<< "$(run_python -c "
+import json, sys
+with open('$json_file') as f:
+    d = json.load(f)
+cm = d.get('coco_metrics', {})
+wt = d.get('wall_time_ms', {})
+gt = d.get('gpu_time_ms', {})
+fp = d.get('fps', {})
+gm = d.get('gpu_monitoring', {})
+pw = gm.get('avg_power_w', 'N/A')
+pw_str = f'{pw:.1f}' if isinstance(pw, (int, float)) else 'N/A'
+print(f\"{cm.get('AP', 0):.4f} {fp.get('from_wall_mean', 0):.1f} {fp.get('from_gpu_mean', 0):.1f} {wt.get('p95', 0):.2f} {wt.get('p99', 0):.2f} {pw_str}\")
+" 2>/dev/null)" || true
+
+    printf "%-22s  %-10s  %-10s  %-10s  %-10s  %-10s  %-10s\n" \
+        "$name" "${ap:--}" "${fps_wall:--}" "${fps_gpu:--}" "${p95:--}" "${p99:--}" "${power:--}"
+done
+
+echo ""
+echo "Resultados estandar en:   ${WORKDIR}/${EVAL_DIR}/*/"
+echo "Resultados optimizados en: ${WORKDIR}/${EVAL_OPT_DIR}/*/"
 echo ""
 
 if [ "$EVAL_FAILED" -gt 0 ]; then
