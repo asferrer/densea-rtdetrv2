@@ -27,68 +27,28 @@ __all__ = [
 
 @register()
 class DataLoader(data.DataLoader):
-    __inject__ = ['dataset', 'collate_fn', 'sampler']
-
-    def __init__(self, dataset, batch_size=1, shuffle=False, sampler=None,
-                 batch_sampler=None, num_workers=0, collate_fn=None,
-                 pin_memory=False, drop_last=False, timeout=0,
-                 worker_init_fn=None, multiprocessing_context=None,
-                 generator=None, prefetch_factor=None,
-                 persistent_workers=False, pin_memory_device=''):
-        # If custom sampler is provided, inject dataset and disable shuffle
-        if sampler is not None:
-            shuffle = False
-            # Inyectar el dataset en el sampler si tiene el atributo dataset
-            if hasattr(sampler, 'dataset'):
-                sampler.dataset = dataset
-            print(f"[DataLoader] Custom sampler detected: {type(sampler).__name__}")
-
-        super().__init__(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            collate_fn=collate_fn,
-            pin_memory=pin_memory,
-            drop_last=drop_last,
-            timeout=timeout,
-            worker_init_fn=worker_init_fn,
-            multiprocessing_context=multiprocessing_context,
-            generator=generator,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers,
-            pin_memory_device=pin_memory_device
-        )
-        self._custom_sampler = sampler
+    __inject__ = ['dataset', 'collate_fn']
 
     def __repr__(self) -> str:
         format_string = self.__class__.__name__ + "("
         for n in ['dataset', 'batch_size', 'num_workers', 'drop_last', 'collate_fn']:
             format_string += "\n"
             format_string += "    {0}: {1}".format(n, getattr(self, n))
-        if self._custom_sampler is not None:
-            format_string += "\n"
-            format_string += "    sampler: {0}".format(type(self._custom_sampler).__name__)
         format_string += "\n)"
         return format_string
 
     def set_epoch(self, epoch):
-        self._epoch = epoch
+        self._epoch = epoch 
         self.dataset.set_epoch(epoch)
         self.collate_fn.set_epoch(epoch)
-        # Set epoch on custom sampler if it has the method
-        if self._custom_sampler is not None and hasattr(self._custom_sampler, 'set_epoch'):
-            self._custom_sampler.set_epoch(epoch)
-
+    
     @property
     def epoch(self):
         return self._epoch if hasattr(self, '_epoch') else -1
 
     @property
     def shuffle(self):
-        return self._shuffle if hasattr(self, '_shuffle') else False
+        return self._shuffle
 
     @shuffle.setter
     def shuffle(self, shuffle):

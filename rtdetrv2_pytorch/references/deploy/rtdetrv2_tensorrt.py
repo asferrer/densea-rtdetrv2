@@ -307,22 +307,22 @@ def plot_score_distributions(score_distribution, label_map, output_dir, detectio
                 ax.set_title(f"{cat_name}\n>{detection_threshold}: {above_threshold} | >0.25: {above_025} | >0.1: {above_01}\nTotal: {total}",
                             fontsize=9)
             else:
-                ax.set_title(f"{cat_name}\nSin predicciones >0.01", fontsize=9)
+                ax.set_title(f"{cat_name}\nNo predictions >0.01", fontsize=9)
         else:
-            ax.set_title(f"{cat_name}\nSin predicciones", fontsize=9)
+            ax.set_title(f"{cat_name}\nNo predictions", fontsize=9)
 
         ax.set_xlabel('Score', fontsize=8)
-        ax.set_ylabel('Frecuencia', fontsize=8)
+        ax.set_ylabel('Frequency', fontsize=8)
         ax.set_xlim(0, 1)
 
     for idx in range(len(sorted_classes), len(axes)):
         axes[idx].axis('off')
 
-    plt.suptitle(f'Distribución de Scores por Clase (Threshold de evaluación: {detection_threshold})', fontsize=12, fontweight='bold')
+    plt.suptitle(f'Score distribution per class (evaluation threshold: {detection_threshold})', fontsize=12, fontweight='bold')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "score_distributions.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Distribución de scores guardada en: {output_dir}/score_distributions.png")
+    print(f"Score distribution saved to: {output_dir}/score_distributions.png")
 
 def plot_confusion_matrix(cm, class_names, output_path):
     if not PLOTTING_AVAILABLE:
@@ -336,10 +336,10 @@ def plot_confusion_matrix(cm, class_names, output_path):
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                     xticklabels=class_names,
                     yticklabels=class_names,
-                    cbar_kws={'label': 'Cantidad'})
-        plt.xlabel("Predicción", fontsize=12)
-        plt.ylabel("Real (Ground Truth)", fontsize=12)
-        plt.title("Matriz de Confusión", fontsize=14, fontweight='bold')
+                    cbar_kws={'label': 'Count'})
+        plt.xlabel("Predicted", fontsize=12)
+        plt.ylabel("Ground Truth", fontsize=12)
+        plt.title("Confusion Matrix", fontsize=14, fontweight='bold')
         plt.xticks(rotation=45, ha='right')
         plt.yticks(rotation=0)
         plt.tight_layout()
@@ -357,7 +357,7 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
     print("\n" + "=" * 70)
     print("TENSORRT EVALUATION MODE")
     print("=" * 70)
-    print(f"  Método de matching:       hungarian")
+    print(f"  Matching method:          hungarian")
     print(f"  IoU threshold:            {args.iou_threshold}")
     print(f"  Detection threshold:      {args.detection_threshold}")
     print(f"  COCO eval threshold:      0.001 (low threshold for mAP)")
@@ -405,7 +405,7 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
         input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
 
         start_time = time.perf_counter()
-        # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+        # IMPORTANT: orig_target_sizes must be [W, H] per the postprocessor convention
         trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
         inference_times.append(time.perf_counter() - start_time)
 
@@ -486,15 +486,15 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
         for pred_lab in unmatched_preds:
             fp_counter[pred_lab] += 1
 
-    print("\n--- Resultados de Rendimiento ---")
+    print("\n--- Performance Results ---")
     if len(inference_times) > 1:
         avg_latency_ms = np.mean(inference_times[1:]) * 1000
         avg_fps = 1.0 / np.mean(inference_times[1:])
-        print(f"Latencia Promedio: {avg_latency_ms:.2f} ms")
+        print(f"Average latency: {avg_latency_ms:.2f} ms")
         print(f"Throughput (FPS): {avg_fps:.2f} FPS")
 
     # Score distributions
-    print("\n--- Generando distribución de scores por clase ---")
+    print("\n--- Generating per-class score distribution ---")
     plot_score_distributions(score_distribution, label_map, args.output_dir, args.detection_threshold)
 
     # COCO Evaluation
@@ -509,9 +509,9 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
     print(coco_summary)
 
     # Confusion Matrix
-    print("\n--- Matriz de Confusión (Hungarian Matching) ---")
+    print("\n--- Confusion Matrix (Hungarian Matching) ---")
     labels_to_report = sorted(list(set(all_y_true + all_y_pred)))
-    target_names = [label_map.get(l, f"Clase_{l}") for l in labels_to_report]
+    target_names = [label_map.get(l, f"Class_{l}") for l in labels_to_report]
 
     from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(all_y_true, all_y_pred, labels=labels_to_report)
@@ -521,7 +521,7 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
     plot_confusion_matrix(cm, target_names, cm_path)
 
     # Per-class AP
-    print("\n--- AP por Clase (COCO) ---")
+    print("\n--- Per-class AP (COCO) ---")
     precisions = coco_eval.eval['precision']
     cat_ids = coco_gt.getCatIds()
     cat_names_list = [coco_gt.loadCats(cat_id)[0]['name'] for cat_id in cat_ids]
@@ -529,8 +529,8 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
     per_class_ap = {}
     per_class_ap50 = {}
     per_class_ap75 = {}
-    per_class_report = "AP por Clase (COCO Metrics)\n" + "=" * 60 + "\n"
-    per_class_report += f"{'Clase':<20} {'AP@0.5:0.95':>12} {'AP@0.50':>12} {'AP@0.75':>12}\n"
+    per_class_report = "Per-class AP (COCO Metrics)\n" + "=" * 60 + "\n"
+    per_class_report += f"{'Class':<20} {'AP@0.5:0.95':>12} {'AP@0.50':>12} {'AP@0.75':>12}\n"
     per_class_report += "-" * 60 + "\n"
 
     for idx, cat_id in enumerate(cat_ids):
@@ -578,20 +578,20 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
 
     # Diagnostic summary
     print("\n" + "=" * 70)
-    print("RESUMEN DIAGNÓSTICO")
+    print("DIAGNOSTIC SUMMARY")
     print("=" * 70)
-    print(f"\n{'ESTADÍSTICAS GLOBALES':^70}")
+    print(f"\n{'GLOBAL STATISTICS':^70}")
     print("-" * 70)
     print(f"  Total Ground Truth:       {total_gt:>8}")
-    print(f"  Total Predicciones:       {total_pred:>8}")
-    print(f"  Total Emparejados:        {total_matched:>8}")
-    print(f"  Falsos Negativos (FN):    {total_fn:>8}  ({100*total_fn/max(total_gt,1):.1f}% de GT)")
-    print(f"  Falsos Positivos (FP):    {total_fp:>8}  ({100*total_fp/max(total_pred,1):.1f}% de pred)")
+    print(f"  Total predictions:       {total_pred:>8}")
+    print(f"  Total matched:           {total_matched:>8}")
+    print(f"  False negatives (FN):    {total_fn:>8}  ({100*total_fn/max(total_gt,1):.1f}% of GT)")
+    print(f"  False positives (FP):    {total_fp:>8}  ({100*total_fp/max(total_pred,1):.1f}% of pred)")
 
     global_recall = total_matched / max(total_gt, 1)
     global_precision = total_matched / max(total_pred, 1)
-    print(f"\n  Recall Global:            {global_recall:>8.2%}")
-    print(f"  Precision Global:         {global_precision:>8.2%}")
+    print(f"\n  Global recall:           {global_recall:>8.2%}")
+    print(f"  Global precision:        {global_precision:>8.2%}")
 
     # Per-class metrics
     class_tp_count = Counter()
@@ -599,9 +599,9 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
         if yt == yp:
             class_tp_count[yt] += 1
 
-    print(f"\n{'ANÁLISIS POR CLASE':^90}")
+    print(f"\n{'PER-CLASS ANALYSIS':^90}")
     print("-" * 90)
-    print(f"{'Clase':<20} {'GT':>6} {'TP':>6} {'FN':>6} {'FP':>6} {'Recall':>8} {'Precision':>10} {'F1':>8}")
+    print(f"{'Class':<20} {'GT':>6} {'TP':>6} {'FN':>6} {'FP':>6} {'Recall':>8} {'Precision':>10} {'F1':>8}")
     print("-" * 90)
 
     for cat_id in sorted(label_map.keys()):
@@ -617,7 +617,7 @@ def run_evaluation(args, context, engine, inputs, outputs, stream):
         print(f"{cat_name:<20} {total_gt_class:>6} {tp:>6} {fn:>6} {fp:>6} {recall:>8.1%} {precision:>10.1%} {f1:>8.3f}")
 
     print("=" * 70)
-    print(f"\nReportes guardados en: {args.output_dir}")
+    print(f"\nReports saved to: {args.output_dir}")
 
     if PYNVML_AVAILABLE: pynvml.nvmlShutdown()
 
@@ -643,7 +643,7 @@ def main(args):
         frame = cv2.imread(args.input)
         if frame is None: print(f"Error reading image: {args.input}"); return
         input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-        # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+        # IMPORTANT: orig_target_sizes must be [W, H] per the postprocessor convention
         trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
         if trt_outputs:
             labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
@@ -662,7 +662,7 @@ def main(args):
             frame = cv2.imread(image_path)
             if frame is None: continue
             input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-            # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+            # IMPORTANT: orig_target_sizes must be [W, H] per the postprocessor convention
             trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
             if trt_outputs:
                 labels_out, boxes_out, scores_out = [trt_outputs.get(n, np.array([])) for n in ["labels", "boxes", "scores"]]
@@ -685,7 +685,7 @@ def main(args):
             ret, frame = cap.read()
             if not ret: break
             input_image_batch = preprocess_image(frame, INPUT_HEIGHT, INPUT_WIDTH)
-            # IMPORTANTE: orig_target_sizes debe ser [W, H] según la convención del postprocessor
+            # IMPORTANT: orig_target_sizes must be [W, H] per the postprocessor convention
             trt_outputs = infer_tensorrt(context, engine, inputs, outputs, stream, input_image_batch, np.array([[frame.shape[1], frame.shape[0]]]))
             annotated_frame = frame.copy()
             if trt_outputs:

@@ -5,4 +5,3 @@
 from . import _transforms
 from . import container
 from . import mosaic
-from . import class_aware

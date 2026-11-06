@@ -1,0 +1,58 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the article below, the dataset and the RT-DETRv2 paper."
+title: "DenSea RT-DETRv2: training and evaluation of RT-DETRv2 on DenSea-Aggregated"
+type: software
+authors:
+  - family-names: "Sánchez Ferrer"
+    given-names: "Alejandro"
+license: Apache-2.0
+repository-code: "https://github.com/asferrer/densea-rtdetrv2"
+keywords:
+  - object detection
+  - marine debris
+  - synthetic data
+  - RT-DETRv2
+preferred-citation:
+  type: article
+  title: "When Does Synthetic Data Help Underwater Debris Detection? Gap Metrics, Data Regimes and Detector Paradigms"
+  authors:
+    - family-names: "Sánchez-Ferrer"
+      given-names: "Alejandro"
+    - family-names: "Gallego"
+      given-names: "Antonio Javier"
+    - family-names: "Calvo-Zaragoza"
+      given-names: "Jorge"
+  journal: "Neurocomputing"
+  year: 2026
+  notes: "Manuscript in preparation"
+references:
+  - type: dataset
+    title: "DenSea-Aggregated: A Group-Aware Benchmark for Underwater Debris Detection"
+    authors:
+      - family-names: "Sánchez-Ferrer"
+        given-names: "Alejandro"
+      - family-names: "Gallego"
+        given-names: "Antonio Javier"
+      - family-names: "Calvo-Zaragoza"
+        given-names: "Jorge"
+    year: 2026
+    publisher:
+      name: "University of Alicante"
+    url: "https://www.dlsi.ua.es/~jgallego/datasets/"
+  - type: generic
+    title: "RT-DETRv2: Improved Baseline with Bag-of-Freebies for Real-Time Detection Transformer"
+    authors:
+      - family-names: "Lv"
+        given-names: "Wenyu"
+      - family-names: "Zhao"
+        given-names: "Yian"
+      - family-names: "Chang"
+        given-names: "Qinyao"
+      - family-names: "Huang"
+        given-names: "Kui"
+      - family-names: "Wang"
+        given-names: "Guanzhong"
+      - family-names: "Liu"
+        given-names: "Yi"
+    year: 2024
+    url: "https://arxiv.org/abs/2407.17140"

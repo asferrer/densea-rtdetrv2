@@ -1,27 +1,26 @@
+# Usage: DATA_ROOT=/path/to/densea_aggregated RUNS_DIR=/path/to/runs docker compose up -d --build
 services:
-  rt-detrv2:
+  rtdetrv2:
     build: .
-    image: rt_detrv2:v1.0
-    container_name: rt_detrv2
-    shm_size: 80gb  # Aumentado para 96GB RAM total (shared memory para PyTorch)
+    image: densea-rtdetrv2:1.0
+    container_name: densea_rtdetrv2
+    shm_size: 32gb
+    ipc: host
+    volumes:
+      - ./rtdetrv2_pytorch:/app/RT-DETR
+      - ${DATA_ROOT:?set DATA_ROOT}:/data:ro
+      - ${RUNS_DIR:?set RUNS_DIR}:/runs
+    ports:
+      - "6007:6007"   # TensorBoard
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FAST_COCOEVAL=1
     deploy:
       resources:
-        limits:
-          memory: 80g  # 80GB de 96GB disponibles (dejar 16GB para Windows)
-          cpus: "16.0"  # Core Ultra 9 285K tiene 24 cores (usar 20)
-    volumes:
-      - ./rtdetrv2_pytorch:/app/RT-DETR # Monta el código fuente en el contenedor
-      - C:\Users\aleja\SynologyDrive\Datasets\Deteccion_Residuos:/app/RT-DETR/dataset # Monta el dataset en el contenedor
-      - C:\Users\aleja\SynologyDrive\Modelos\Deteccion_residuos\RT-DETRv2\Entrenamientos\Experimentos con datos sintéticos:/app/RT-DETR/experiment_output # Monta la carpeta de experimentos para guardar resultados
-    ports:
-      - "6007:6007"  # Mapea el puerto de TensorBoard
-      - "8502:8502"  # Puerto para streamlit
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - CUDA_VISIBLE_DEVICES=0
-      - PYTHONUNBUFFERED=1
-      - NCCL_DEBUG=INFO
-    runtime: nvidia
-    ipc: host
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     stdin_open: true
     tty: true

@@ -50,7 +50,7 @@ class ClasSolver(BaseSolver):
                 if (epoch + 1) % args.checkpoint_freq == 0:
                     checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
                 for checkpoint_path in checkpoint_paths:
-                    dist_utils.save_on_master(self.state_dict(epoch), checkpoint_path)
+                    dist_utils.save_checkpoint_fast(self.state_dict(epoch), checkpoint_path)
 
             module = self.ema.module if self.ema else self.model
             test_stats = evaluate(module, self.criterion, self.val_dataloader, self.device)

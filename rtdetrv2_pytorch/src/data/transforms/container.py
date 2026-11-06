@@ -30,7 +30,7 @@ class Compose(nn.Module):
                 elif hasattr(T, name):
                     transform_class = getattr(T, name)
                 else:
-                    raise NameError(f"Transformación '{name}' no encontrada.")
+                    raise NameError(f"Transform '{name}' not found.")
 
                 if 'dtype' in op_copy and isinstance(op_copy['dtype'], str):
                     op_copy['dtype'] = getattr(torch, op_copy['dtype'].split('.')[-1])
@@ -44,23 +44,23 @@ class Compose(nn.Module):
         img, target = inputs[0], inputs[1]
 
         # print("\n" + "="*80)
-        # print("--- INICIO PIPELINE DE TRANSFORMACIONES ---")
-        # print(f"Entrada inicial -> img: {type(img)}, target: {type(target)}")
+        # print("--- START OF TRANSFORM PIPELINE ---")
+        # print(f"Initial input -> img: {type(img)}, target: {type(target)}")
         # print("="*80)
 
         for i, t in enumerate(self.transforms):
             transform_name = type(t).__name__
-            # print(f"\n[Paso {i+1}/{len(self.transforms)}] Aplicando '{transform_name}'...")
-            # print(f"  - Antes  -> img: {type(img)}, target: {type(target)}")
+            # print(f"\n[Step {i+1}/{len(self.transforms)}] Applying '{transform_name}'...")
+            # print(f"  - Before -> img: {type(img)}, target: {type(target)}")
             
             try:
                 img, target = t(img, target)
-                # print(f"  - Después -> img: {type(img)}, target: {type(target)}")
-                # print(f"  -> OK: '{transform_name}' aplicada con éxito.")
+                # print(f"  - After  -> img: {type(img)}, target: {type(target)}")
+                # print(f"  -> OK: '{transform_name}' applied successfully.")
             except Exception as e:
                 # print("\n" + "!"*80)
-                # print(f"!!! ERROR al aplicar la transformación '{transform_name}' !!!")
-                # print(f"!!! Tipo de error: {type(e).__name__} - {e} !!!")
+                # print(f"!!! ERROR applying transform '{transform_name}' !!!")
+                # print(f"!!! Error type: {type(e).__name__} - {e} !!!")
                 # print("!"*80)
                 raise e
 

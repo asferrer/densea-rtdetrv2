@@ -121,6 +121,32 @@ def save_on_master(*args, **kwargs):
         torch.save(*args, **kwargs)
 
 
+def save_checkpoint_fast(obj, path):
+    """Save `obj` to `path` atomically with a single write (same bytes as torch.save).
+
+    Serializes to memory (BytesIO), writes a temp file in the same directory with fsync and renames it
+    with os.replace, so an interrupted process never leaves a partial file. Peak RAM: file size.
+    Only saves on the main process.
+    """
+    if not is_main_process():
+        return
+    import io
+    import os
+    path = os.fspath(path)
+    buf = io.BytesIO()
+    torch.save(obj, buf)
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(buf.getbuffer())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 
 def warp_model(
     model: torch.nn.Module, 

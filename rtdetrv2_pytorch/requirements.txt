@@ -1,6 +1,19 @@
-torch>=2.0.1
-torchvision>=0.15.2
-pycocotools
-PyYAML
-tensorboard
-tqdm
+# Versions used for the DenSea-Aggregated experiments (Python 3.11, CUDA 12.8 wheels).
+torch==2.7.0
+torchvision==0.22.0
+numpy==2.2.5
+pycocotools==2.0.11
+faster-coco-eval==1.8.0
+PyYAML==6.0.2
+tensorboard==2.20.0
+tqdm==4.67.1
+# Only needed by tools/eval.py (confusion matrix, plots), export and deployment scripts
+scipy==1.17.0
+scikit-learn==1.8.0
+matplotlib==3.10.8
+seaborn==0.13.2
+pillow==11.0.0
+opencv-python-headless==4.13.0.92
+onnx==1.20.1
+onnx-simplifier==0.4.36
+onnxruntime-gpu==1.23.2

@@ -28,8 +28,8 @@ optimizer:
 
 lr_scheduler:
   type: CosineAnnealingLR
-  T_max: 200  # Número total de épocas
-  eta_min: 1e-6  # Learning rate mínimo
+  T_max: 200  # total number of epochs
+  eta_min: 1e-6  # minimum learning rate
 
 
 lr_warmup_scheduler:

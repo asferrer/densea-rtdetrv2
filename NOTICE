@@ -1,0 +1,11 @@
+DenSea RT-DETRv2
+Copyright 2026 Alejandro Sanchez Ferrer
+
+This repository is a derivative work of RT-DETR / RT-DETRv2 (https://github.com/lyuwenyu/RT-DETR),
+Copyright (c) 2023 lyuwenyu, licensed under the Apache License, Version 2.0. The starting point is the
+rtdetrv2_pytorch/ directory at upstream commit 70eed1e46c5d705134069a3d55090e58d529f42d (2025-01-17).
+Files modified from upstream are listed in CHANGES.md; the copyright headers of upstream are kept in
+the files.
+
+The upstream code in turn includes code from other projects, whose notices are kept in the headers
+of the corresponding files (for example DETR, Deformable DETR, Conditional DETR and DN-DETR).

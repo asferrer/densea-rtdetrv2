@@ -25,6 +25,52 @@ class DetSolver(BaseSolver):
         self.epochs_without_improvement = 0
         self.best_metric_value = -float('inf')
 
+    @staticmethod
+    def _update_best_stat(best_stat, k, value, epoch):
+        """Best-checkpoint selection (strictly greater, no min_delta)."""
+        if k in best_stat:
+            best_stat['epoch'] = epoch if value > best_stat[k] else best_stat['epoch']
+            best_stat[k] = max(best_stat[k], value)
+        else:
+            best_stat['epoch'] = epoch
+            best_stat[k] = value
+
+    def _update_early_stopping(self, test_stats):
+        """Patience counter: improvement = strictly greater than best + min_delta."""
+        current_metric = test_stats.get(self.early_stopping_metric, [0])[0]
+        if current_metric > self.best_metric_value + self.early_stopping_min_delta:
+            self.best_metric_value = current_metric
+            self.epochs_without_improvement = 0
+        else:
+            self.epochs_without_improvement += 1
+
+    def _restore_selection_state(self, best_stat, start_epoch):
+        """Rebuild best_stat, best_metric_value and epochs_without_improvement
+        from log.txt using epochs < start_epoch, applying the same logic."""
+        log_path = self.output_dir / "log.txt"
+        if not log_path.exists():
+            print('Resume: no log.txt found, best value and patience start from scratch')
+            return
+        by_epoch = {}
+        with log_path.open() as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue  # line truncated by a crash
+                if isinstance(rec.get('epoch'), int) and rec['epoch'] < start_epoch:
+                    by_epoch[rec['epoch']] = rec  # if an epoch is repeated, the last record wins
+        for epoch in sorted(by_epoch):
+            test_stats = {k[len('test_'):]: v for k, v in by_epoch[epoch].items()
+                          if k.startswith('test_') and isinstance(v, list) and v}
+            for k in test_stats:
+                self._update_best_stat(best_stat, k, test_stats[k][0], epoch)
+            if self.early_stopping_patience is not None:
+                self._update_early_stopping(test_stats)
+        print(f'Resume: state rebuilt from {len(by_epoch)} epochs of log.txt: '
+              f'best_stat={best_stat}, best_metric_value={self.best_metric_value}, '
+              f'epochs_without_improvement={self.epochs_without_improvement}')
+
     def fit(self, ):
         print("Start training")
         self.train()
@@ -47,6 +93,11 @@ class DetSolver(BaseSolver):
 
         start_time = time.time()
         start_epcoch = self.last_epoch + 1
+
+        # On resume, best value and patience are rebuilt from log.txt
+        # (only epochs before the resume epoch)
+        if start_epcoch > 0 and self.output_dir:
+            self._restore_selection_state(best_stat, start_epcoch)
         
         for epoch in range(start_epcoch, args.epoches):
 
@@ -71,10 +122,10 @@ class DetSolver(BaseSolver):
             )
 
             if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
-                # Antes de usar lr_scheduler.step(), verifica los tipos
+                # Before lr_scheduler.step(), check the types
                 for group in self.optimizer.param_groups:
-                    assert isinstance(group["lr"], float), f"Learning rate debe ser float, pero es {type(group['lr'])}"
-                assert isinstance(self.lr_scheduler.eta_min, float), f"eta_min debe ser float, pero es {type(self.lr_scheduler.eta_min)}"
+                    assert isinstance(group["lr"], float), f"Learning rate must be float, got {type(group['lr'])}"
+                assert isinstance(self.lr_scheduler.eta_min, float), f"eta_min must be float, got {type(self.lr_scheduler.eta_min)}"
                 self.lr_scheduler.step()
             
             self.last_epoch += 1
@@ -85,7 +136,7 @@ class DetSolver(BaseSolver):
                 if (epoch + 1) % args.checkpoint_freq == 0:
                     checkpoint_paths.append(self.output_dir / f'checkpoint{epoch:04}.pth')
                 for checkpoint_path in checkpoint_paths:
-                    dist_utils.save_on_master(self.state_dict(), checkpoint_path)
+                    dist_utils.save_checkpoint_fast(self.state_dict(), checkpoint_path)
 
             module = self.ema.module if self.ema else self.model
             test_stats, coco_evaluator = evaluate(
@@ -108,27 +159,16 @@ class DetSolver(BaseSolver):
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
 
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
-                else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+                self._update_best_stat(best_stat, k, test_stats[k][0], epoch)
 
                 if best_stat['epoch'] == epoch and self.output_dir:
-                    dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best.pth')
+                    dist_utils.save_checkpoint_fast(self.state_dict(), self.output_dir / 'best.pth')
 
             print(f'best_stat: {best_stat}')
 
             # Early stopping check
             if self.early_stopping_patience is not None:
-                current_metric = test_stats.get(self.early_stopping_metric, [0])[0]
-
-                if current_metric > self.best_metric_value + self.early_stopping_min_delta:
-                    self.best_metric_value = current_metric
-                    self.epochs_without_improvement = 0
-                else:
-                    self.epochs_without_improvement += 1
+                self._update_early_stopping(test_stats)
 
                 if dist_utils.is_main_process():
                     print(f'Early stopping: {self.epochs_without_improvement}/{self.early_stopping_patience} epochs without improvement')
@@ -160,7 +200,7 @@ class DetSolver(BaseSolver):
                         if epoch % 50 == 0:
                             filenames.append(f'{epoch:03}.pth')
                         for name in filenames:
-                            torch.save(coco_evaluator.coco_eval["bbox"].eval,
+                            dist_utils.save_checkpoint_fast(coco_evaluator.coco_eval["bbox"].eval,
                                     self.output_dir / "eval" / name)
 
         total_time = time.time() - start_time
@@ -176,7 +216,7 @@ class DetSolver(BaseSolver):
                 self.val_dataloader, self.evaluator, self.device)
 
         if self.output_dir:
-            dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
+            dist_utils.save_checkpoint_fast(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
 
         return
 

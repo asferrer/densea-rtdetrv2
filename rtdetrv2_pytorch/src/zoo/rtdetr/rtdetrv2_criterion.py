@@ -59,7 +59,7 @@ class RTDETRCriterionv2(nn.Module):
         # Class weights for handling class imbalance
         if class_weights is not None:
             self.register_buffer('class_weights', torch.tensor(class_weights, dtype=torch.float32))
-            print(f"[RTDETRCriterionv2] Class weights habilitados: {class_weights}")
+            print(f"[RTDETRCriterionv2] Class weights enabled: {class_weights}")
         else:
             self.class_weights = None
 
@@ -74,7 +74,7 @@ class RTDETRCriterionv2(nn.Module):
         target = F.one_hot(target_classes, num_classes=self.num_classes+1)[..., :-1]
         loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction='none')
 
-        # Aplicar class_weights si están definidos
+        # Apply class_weights if defined
         if self.class_weights is not None:
             cw = self.class_weights.to(loss.device)
             loss = loss * cw.unsqueeze(0).unsqueeze(0)
@@ -108,12 +108,12 @@ class RTDETRCriterionv2(nn.Module):
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
 
-        # Aplicar class_weights si están definidos
-        # Esto aumenta la importancia de clases minoritarias en la pérdida
+        # Apply class_weights if defined
+        # This increases the weight of minority classes in the loss
         if self.class_weights is not None:
-            # class_weights tiene forma [num_classes], necesitamos expandirlo a [batch, queries, num_classes]
+            # class_weights has shape [num_classes]; expand it to [batch, queries, num_classes]
             cw = self.class_weights.to(weight.device)
-            # Multiplicar el weight por los class_weights para cada clase
+            # Multiply the weight by the class_weights of each class
             weight = weight * cw.unsqueeze(0).unsqueeze(0)
 
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')

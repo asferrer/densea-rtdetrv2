@@ -37,7 +37,7 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         self.return_masks = return_masks
         self.remap_mscoco_category = remap_mscoco_category
         self._initialize_categories()
-        # El atributo 'epoch' se establece a través de set_epoch para evitar conflictos
+        # The 'epoch' attribute is set through set_epoch to avoid conflicts
     
     def set_epoch(self, epoch):
         """ This is called by the solver to set the epoch.
@@ -47,13 +47,13 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
 
     def _initialize_categories(self):
         """
-        Lee las categorías directamente del archivo de anotaciones COCO.
+        Read the categories directly from the COCO annotation file.
         """
         self.categories = self.coco.dataset['categories']
         self.category2name = {cat['id']: cat['name'] for cat in self.categories}
         self.mscoco_category2label = {cat['id']: i for i, cat in enumerate(self.categories)}
         self.mscoco_label2category = {i: cat['id'] for i, cat in enumerate(self.categories)}
-        print(f"Categorías inicializadas: {len(self.categories)} categorías cargadas.")
+        print(f"Categories initialized: {len(self.categories)} categories loaded.")
 
     @classmethod
     def get_category_mappings(cls, coco_instance):
@@ -69,19 +69,19 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
             class_counts[ann['category_id']] += 1
         class_counts_named = {self.category2name.get(k, k): v for k, v in class_counts.items()}
         import pandas as pd
-        df = pd.DataFrame({"Clase": list(class_counts_named.keys()), "Número de Instancias": list(class_counts_named.values())})
+        df = pd.DataFrame({"Class": list(class_counts_named.keys()), "Number of Instances": list(class_counts_named.values())})
         sns.set_theme(style="whitegrid")
         plt.figure(figsize=(12, 8))
-        ax = sns.barplot(x="Número de Instancias", y="Clase", data=df, palette="viridis", hue="Clase", dodge=False, legend=False)
-        plt.title(f"Distribución de Instancias por Clase en {split_name}", fontsize=16)
-        plt.xlabel("Número de Instancias", fontsize=14)
-        plt.ylabel("Clases", fontsize=14)
-        for i, (count, y) in enumerate(zip(df["Número de Instancias"], df["Clase"])):
+        ax = sns.barplot(x="Number of Instances", y="Class", data=df, palette="viridis", hue="Class", dodge=False, legend=False)
+        plt.title(f"Instance distribution per class in {split_name}", fontsize=16)
+        plt.xlabel("Number of Instances", fontsize=14)
+        plt.ylabel("Classes", fontsize=14)
+        for i, (count, y) in enumerate(zip(df["Number of Instances"], df["Class"])):
             ax.text(count + 0.5, i, str(count), va='center', fontsize=12)
         if save_path:
             plt.tight_layout()
             plt.savefig(save_path, dpi=150)
-            print(f"Gráfico guardado en: {save_path}")
+            print(f"Plot saved to: {save_path}")
         else:
             plt.show()
         return class_counts_named
@@ -175,8 +175,8 @@ class ConvertCocoPolysToMask(object):
 
         target_out["area"] = torch.tensor([obj["area"] for obj in anno])[keep]
         target_out["iscrowd"] = torch.tensor([obj.get("iscrowd", 0) for obj in anno])[keep]
-        # IMPORTANTE: El postprocessor espera [W, H] según la documentación
-        # Ver box_revert.py línea 38: "orig_sizes(Tensor), [N, 2], (w, h)"
+        # IMPORTANT: the postprocessor expects [W, H] per its documentation
+        # See box_revert.py line 38: "orig_sizes(Tensor), [N, 2], (w, h)"
         target_out["orig_size"] = torch.as_tensor([int(w), int(h)])
     
         return image, target_out
@@ -193,14 +193,14 @@ mscoco_label2category = {v: k for k, v in mscoco_category2label.items()}
 @register()
 class MultiDirCocoDetection(CocoDetection):
     def __init__(self, image_dirs=None, ann_file=None, transforms=None, **kwargs):
-        # Para mantener la compatibilidad, aceptamos ambos nombres de argumento
+        # For compatibility, accept both argument names
         if 'anno_path' in kwargs:
             ann_file = kwargs.pop('anno_path')
         if 'image_dir' in kwargs:
             image_dirs = kwargs.pop('image_dir')
 
-        if not ann_file: raise ValueError("Debes proporcionar 'ann_file' o 'anno_path'.")
-        if not image_dirs: raise ValueError("Debes proporcionar 'image_dirs' o 'image_dir'.")
+        if not ann_file: raise ValueError("You must provide 'ann_file' or 'anno_path'.")
+        if not image_dirs: raise ValueError("You must provide 'image_dirs' or 'image_dir'.")
 
         super().__init__(img_folder="", ann_file=ann_file, transforms=transforms, **kwargs)
         self.image_dirs = image_dirs if isinstance(image_dirs, list) else [image_dirs]
@@ -213,7 +213,7 @@ class MultiDirCocoDetection(CocoDetection):
 
         found_path = next((os.path.join(d, path) for d in self.image_dirs if os.path.exists(os.path.join(d, path))), None)
         if not found_path:
-            raise FileNotFoundError(f"No se encontró la imagen '{path}' en los directorios {self.image_dirs}")
+            raise FileNotFoundError(f"Image '{path}' not found in directories {self.image_dirs}")
 
         image = Image.open(found_path).convert("RGB")
         target = {'image_id': img_id, 'annotations': target_anno}
@@ -236,18 +236,18 @@ def analyze_annotations(coco, save_path=None, split_name="Dataset"):
     class_counts_named = {id_to_name.get(k, k): v for k, v in class_counts.items()}
     
     import pandas as pd
-    data = pd.DataFrame(class_counts_named.items(), columns=["Clase", "Número de Instancias"])
+    data = pd.DataFrame(class_counts_named.items(), columns=["Class", "Number of Instances"])
     
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(12, 8))
-    sns.barplot(x="Número de Instancias", y="Clase", data=data, palette="viridis")
-    plt.title(f"Distribución de Instancias por Clase en {split_name}", fontsize=16)
-    plt.xlabel("Número de Instancias", fontsize=14)
-    plt.ylabel("Clases", fontsize=14)
+    sns.barplot(x="Number of Instances", y="Class", data=data, palette="viridis")
+    plt.title(f"Instance distribution per class in {split_name}", fontsize=16)
+    plt.xlabel("Number of Instances", fontsize=14)
+    plt.ylabel("Classes", fontsize=14)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150)
-        print(f"Gráfico guardado en: {save_path}")
+        print(f"Plot saved to: {save_path}")
     else:
         plt.show()
     return class_counts_named

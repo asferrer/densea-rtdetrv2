@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-Script de inferencia para RT-DETR-V2 que detecta automáticamente el modo de entrada 
-(en imagen, video o cámara/stream) en función del input recibido.
-No se muestra la salida en tiempo real, sino que se guarda automáticamente la inferencia 
-(con las detecciones pintadas) usando un nombre que combina el nombre del input y el nombre
-del archivo de configuración. Si en algún frame no se detecta nada, se guarda el frame original.
+Inference script for RT-DETR-V2 that automatically detects the input mode
+(image, video or camera/stream) from the given input.
+Output is not shown live; the inference result (with detections drawn) is saved
+automatically under a name combining the input name and the config file name.
+If nothing is detected in a frame, the original frame is saved.
 """
 
 import os
@@ -19,12 +19,12 @@ import numpy as np
 import colorsys
 from tqdm import tqdm
 
-# Se añade el directorio padre para poder importar YAMLConfig y otros módulos internos.
+# Add the parent directory so YAMLConfig and other internal modules can be imported.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from src.core import YAMLConfig
 
 ########################
-# Funciones auxiliares de visualización
+# Visualization helpers
 ########################
 
 def generate_color_map_from_label_map(label_map: dict) -> dict:
@@ -43,16 +43,16 @@ def get_label_map(dataset) -> dict:
     try:
         categories = dataset.coco.dataset.get('categories', [])
         for cat in categories:
-            # Convertir la clave a entero para asegurar consistencia
+            # Convert the key to int for consistency
             label_map[int(cat['id'])] = cat['name']
     except Exception as e:
-        print(f"No se pudo obtener el mapeo de etiquetas: {e}")
+        print(f"Could not get the label mapping: {e}")
     return label_map
 
 def compute_label_offset(pred_labels_tensor: torch.Tensor, label_map: dict) -> int:
     """
-    Determina dinámicamente el offset a aplicar a las etiquetas predichas para que sean coherentes
-    con el mapeo de etiquetas. Si el modelo ya produce etiquetas iniciando en 0, se devuelve 0.
+    Dynamically determine the offset to apply to the predicted labels so they are consistent
+    with the label mapping. If the model already produces labels starting at 0, returns 0.
     """
     if pred_labels_tensor.numel() > 0:
         raw_pred_min = int(pred_labels_tensor.min().item())
@@ -65,15 +65,15 @@ def draw_inferences_pil(image: Image.Image, labels: torch.Tensor, boxes: torch.T
                          label_map=None, color_map=None, threshold: float = 0.5, 
                          label_offset: int = 0, radius: int = 2):
     """
-    Dibuja las inferencias sobre una imagen PIL de forma minimalista. 
-    Si no se detecta nada (todos los scores ≤ threshold), se devuelve la imagen original.
-    Se utiliza el parámetro 'label_offset' para ajustar las etiquetas en caso necesario.
+    Draw the inferences on a PIL image in a minimalist way.
+    If nothing is detected (all scores <= threshold), the original image is returned.
+    The 'label_offset' parameter adjusts the labels when needed.
     """
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
     
     valid_indices = scores > threshold
-    # Si no hay detecciones válidas, se devuelve la imagen original
+    # If there are no valid detections, return the original image
     if valid_indices.sum() == 0:
         return image
 
@@ -83,7 +83,7 @@ def draw_inferences_pil(image: Image.Image, labels: torch.Tensor, boxes: torch.T
     padding = 2
     for j, box in enumerate(valid_boxes):
         x0, y0, x1, y1 = map(int, box)
-        # Se aplica el offset; dado que el modelo produce índices 0-indexados, no se suma 1
+        # Apply the offset; the model produces 0-indexed labels, so 1 is not added
         pred_id = valid_labels[j].item() + label_offset
         color = color_map.get(pred_id, "black") if color_map is not None else "black"
         draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, outline=color, width=1)
@@ -103,7 +103,7 @@ def draw_inferences_pil(image: Image.Image, labels: torch.Tensor, boxes: torch.T
     return image
 
 ########################
-# Funciones de conversión entre PIL y OpenCV
+# PIL <-> OpenCV conversion helpers
 ########################
 
 def pil_to_cv2(image: Image.Image) -> np.ndarray:
@@ -115,7 +115,7 @@ def cv2_to_pil(frame: np.ndarray) -> Image.Image:
     return Image.fromarray(frame)
 
 ########################
-# Clase ModelWrapper
+# ModelWrapper class
 ########################
 
 class ModelWrapper(nn.Module):
@@ -127,25 +127,25 @@ class ModelWrapper(nn.Module):
     def forward(self, images, orig_target_sizes):
         outputs = self.model(images)
         outputs = self.postprocessor(outputs, orig_target_sizes)
-        return outputs  # Se espera (labels, boxes, scores)
+        return outputs  # Expected (labels, boxes, scores)
 
 ########################
-# Inferencia en un frame
+# Inference on a single frame
 ########################
 
 def inference_on_frame(frame: np.ndarray, model, transform, device, label_map, color_map, threshold=0.5):
     """
-    Realiza inferencia sobre un frame. Se convierte el frame a PIL, se aplica el transform para inferencia,
-    se calcula el offset (aunque en este caso será 0, ya que el modelo produce etiquetas iniciando en 0)
-    y se dibujan las detecciones sobre la imagen PIL.
-    Se devuelve el frame anotado en el mismo tamaño original.
+    Run inference on a frame. The frame is converted to PIL, the inference transform is applied,
+    the offset is computed (0 here, since the model produces labels starting at 0)
+    and the detections are drawn on the PIL image.
+    The annotated frame is returned at the original size.
     """
     pil_img = cv2_to_pil(frame)
     input_tensor = transform(pil_img).unsqueeze(0).to(device)
     orig_size = torch.tensor([pil_img.width, pil_img.height])[None].to(device)
     with torch.no_grad():
         labels, boxes, scores = model(input_tensor, orig_size)
-    # Calcular offset (debería ser 0 si el modelo ya produce índices 0-indexados)
+    # Compute offset (should be 0 if the model already produces 0-indexed labels)
     label_offset = compute_label_offset(labels[0].cpu(), label_map)
     annotated_pil = draw_inferences_pil(pil_img, labels[0], boxes[0], scores[0],
                                          label_map=label_map, color_map=color_map, threshold=threshold,
@@ -155,7 +155,7 @@ def inference_on_frame(frame: np.ndarray, model, transform, device, label_map, c
     return annotated_frame
 
 ########################
-# Detección automática de modo
+# Automatic mode detection
 ########################
 
 def auto_detect_mode(input_source: str) -> str:
@@ -180,29 +180,29 @@ def auto_detect_mode(input_source: str) -> str:
                 return "camera"
 
 ########################
-# Función principal
+# Main function
 ########################
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Script de inferencia para imágenes, video o cámara (RTSP/webcam) que guarda automáticamente el resultado."
+        description="Inference script for images, video or camera (RTSP/webcam) that saves the result automatically."
     )
-    parser.add_argument('-c', '--config', type=str, required=True, help="Ruta al archivo YAML de configuración.")
-    parser.add_argument('-r', '--resume', type=str, required=True, help="Ruta al checkpoint del modelo.")
-    parser.add_argument('-d', '--device', type=str, default='cuda', help="Dispositivo: cpu o cuda.")
+    parser.add_argument('-c', '--config', type=str, required=True, help="Path to the YAML configuration file.")
+    parser.add_argument('-r', '--resume', type=str, required=True, help="Path to the model checkpoint.")
+    parser.add_argument('-d', '--device', type=str, default='cuda', help="Device: cpu or cuda.")
     parser.add_argument('-i', '--input', type=str, required=True,
-                        help="Ruta al archivo de imagen/video o índice/URL para cámara (RTSP/webcam).")
+                        help="Path to the image/video file, or index/URL for a camera (RTSP/webcam).")
     parser.add_argument('--save_dir', type=str, default='inference_results',
-                        help="Directorio base para guardar los resultados.")
-    parser.add_argument('--threshold', type=float, default=0.5, help="Umbral para filtrar detecciones.")
+                        help="Base directory to save the results.")
+    parser.add_argument('--threshold', type=float, default=0.5, help="Threshold to filter detections.")
     args = parser.parse_args()
     device = torch.device(args.device)
     
-    # Detectar automáticamente el modo
+    # Detect the mode automatically
     mode = auto_detect_mode(args.input)
-    print(f"Modo detectado: {mode}")
+    print(f"Detected mode: {mode}")
     
-    # Cargar configuración y modelo
+    # Load configuration and model
     cfg = YAMLConfig(args.config, resume=args.resume)
     checkpoint = torch.load(args.resume, map_location=device)
     if 'ema' in checkpoint:
@@ -214,17 +214,17 @@ def main():
     model = ModelWrapper(cfg).to(device)
     model.eval()
     
-    # Obtener label map y color map (asegurando que las claves sean enteros)
+    # Get label map and color map (making sure keys are integers)
     label_map = get_label_map(cfg.val_dataloader.dataset)
     color_map = generate_color_map_from_label_map(label_map)
     
-    # Definir transformación de entrada para cumplir con el input del modelo
+    # Define the input transform to match the model input
     transform = T.Compose([
         T.Resize((640, 640)),
         T.ToTensor(),
     ])
     
-    # Crear directorio para guardar resultados
+    # Create the directory to save the results
     os.makedirs(args.save_dir, exist_ok=True)
     input_basename = os.path.splitext(os.path.basename(args.input))[0]
     config_name = os.path.splitext(os.path.basename(args.config))[0]
@@ -235,7 +235,7 @@ def main():
         orig_size = torch.tensor([pil_img.width, pil_img.height])[None].to(device)
         with torch.no_grad():
             labels, boxes, scores = model(input_tensor, orig_size)
-        # Calcular offset (debería ser 0)
+        # Compute offset (should be 0)
         label_offset = compute_label_offset(labels[0].cpu(), label_map)
         annotated_img = draw_inferences_pil(pil_img, labels[0], boxes[0], scores[0],
                                              label_map=label_map, color_map=color_map, threshold=args.threshold,
@@ -243,7 +243,7 @@ def main():
         out_filename = f"{input_basename}_{config_name}.jpg"
         out_path = os.path.join(args.save_dir, out_filename)
         annotated_img.save(out_path)
-        print(f"Imagen inferida guardada en: {out_path}")
+        print(f"Inferred image saved to: {out_path}")
     elif mode in ["video", "camera"]:
         if mode == "video":
             cap = cv2.VideoCapture(args.input)
@@ -254,7 +254,7 @@ def main():
             except ValueError:
                 cap = cv2.VideoCapture(args.input)
         if not cap.isOpened():
-            print("Error: no se pudo abrir la fuente de video/cámara.")
+            print("Error: could not open the video/camera source.")
             return
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -266,7 +266,7 @@ def main():
         out_writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if mode == "video" else None
-        pbar = tqdm(total=total_frames, desc="Procesando frames", unit="frame")
+        pbar = tqdm(total=total_frames, desc="Processing frames", unit="frame")
         
         while True:
             ret, frame = cap.read()
@@ -279,7 +279,7 @@ def main():
         pbar.close()
         cap.release()
         out_writer.release()
-        print(f"Video inferido guardado en: {out_path}")
+        print(f"Inferred video saved to: {out_path}")
 
 if __name__ == '__main__':
     main()

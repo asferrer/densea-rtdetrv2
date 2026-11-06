@@ -113,25 +113,25 @@ class ConvertBoxes(nn.Module):
         self.normalize = normalize
 
     def forward(self, img, target):
-        # Primero, nos aseguramos de que las cajas existan y sean del tipo correcto.
+        # First, make sure the boxes exist and have the right type.
         if 'boxes' in target and isinstance(target['boxes'], BoundingBoxes):
             boxes = target['boxes']
             
-            # 1. Convertir formato
+            # 1. Convert format
             boxes = F.convert_bounding_box_format(boxes, new_format=self.fmt)
             
-            # 2. Normalizar manualmente para evitar la llamada ambigua
+            # 2. Normalize manually to avoid the ambiguous call
             if self.normalize:
-                # Obtenemos el tamaño del lienzo desde el propio objeto BoundingBoxes
+                # Get the canvas size from the BoundingBoxes object itself
                 h, w = boxes.canvas_size
                 if self.fmt == 'cxcywh':
-                    # Normalizar cx, x, w
+                    # Normalize cx, x, w
                     boxes[:, 0] /= w
                     boxes[:, 2] /= w
-                    # Normalizar cy, y, h
+                    # Normalize cy, y, h
                     boxes[:, 1] /= h
                     boxes[:, 3] /= h
-                else: # asume xyxy
+                else: # assumes xyxy
                     boxes[:, 0::2] /= w
                     boxes[:, 1::2] /= h
 
@@ -153,12 +153,12 @@ class ToDtype(T.ToDtype):
 @register()
 class SyntheticDomainAdaptation(nn.Module):
     """
-    Transform específico para cerrar el domain gap entre imágenes sintéticas y reales.
+    Transform to close the domain gap between synthetic and real images.
 
-    NUEVO: Soporta ajustes independientes por canal RGB basados en análisis de domain gap.
+    Supports independent per-channel RGB adjustments based on a domain gap analysis.
 
-    Uso:
-        # Con parámetros de domain_gap_analysis.json:
+    Usage:
+        # With parameters from a domain gap analysis:
         - {type: SyntheticDomainAdaptation,
            brightness_factor: [0.80, 0.90],
            red_adjustment: [0.85, 0.95],
@@ -174,26 +174,26 @@ class SyntheticDomainAdaptation(nn.Module):
            p: 0.7}
     """
     def __init__(self,
-                 brightness_factor=(0.7, 0.9),      # Ajuste global de brillo
-                 red_adjustment=None,               # NUEVO: Ajuste específico canal R
-                 green_adjustment=None,             # NUEVO: Ajuste específico canal G
-                 blue_adjustment=None,              # NUEVO: Ajuste específico canal B
+                 brightness_factor=(0.7, 0.9),      # Global brightness adjustment
+                 red_adjustment=None,               # Channel-specific R adjustment
+                 green_adjustment=None,             # Channel-specific G adjustment
+                 blue_adjustment=None,              # Channel-specific B adjustment
                  # Legacy parameters (backward compatibility)
-                 blue_reduction=None,               # Legacy: reducir azul
-                 green_reduction=None,              # Legacy: reducir verde
+                 blue_reduction=None,               # Legacy: reduce blue
+                 green_reduction=None,              # Legacy: reduce green
                  p=0.7):
         super().__init__()
         self.brightness_factor = brightness_factor
 
-        # Si se usan parámetros nuevos (red/green/blue_adjustment), usarlos
-        # Si no, usar legacy (blue_reduction, green_reduction)
+        # If the new parameters (red/green/blue_adjustment) are used, use them
+        # Otherwise, use legacy (blue_reduction, green_reduction)
         if red_adjustment is not None:
             self.red_adjustment = red_adjustment
             self.green_adjustment = green_adjustment if green_adjustment is not None else (1.0, 1.0)
             self.blue_adjustment = blue_adjustment if blue_adjustment is not None else (1.0, 1.0)
         else:
-            # Modo legacy: solo brillo + reducción de green/blue
-            self.red_adjustment = (1.0, 1.0)  # Sin ajuste
+            # Legacy mode: brightness + green/blue reduction only
+            self.red_adjustment = (1.0, 1.0)  # No adjustment
             self.green_adjustment = green_reduction if green_reduction is not None else (0.85, 0.95)
             self.blue_adjustment = blue_reduction if blue_reduction is not None else (0.7, 0.9)
 
@@ -202,26 +202,26 @@ class SyntheticDomainAdaptation(nn.Module):
     def forward(self, img, target):
         if torch.rand(1) < self.p:
             if isinstance(img, torch.Tensor):
-                # Generar factores aleatorios para cada canal
+                # Sample random factors for each channel
                 b_factor = torch.empty(1).uniform_(*self.brightness_factor).item()
                 r_factor = torch.empty(1).uniform_(*self.red_adjustment).item()
                 g_factor = torch.empty(1).uniform_(*self.green_adjustment).item()
                 blue_factor = torch.empty(1).uniform_(*self.blue_adjustment).item()
 
-                # Aplicar ajustes por canal
+                # Apply per-channel adjustments
                 if img.dim() == 3:
                     if img.shape[0] == 3:  # CHW (C, H, W)
                         img = img.clone()
-                        img[0] = img[0] * b_factor * r_factor      # R: brillo × ajuste_R
-                        img[1] = img[1] * b_factor * g_factor      # G: brillo × ajuste_G
-                        img[2] = img[2] * b_factor * blue_factor   # B: brillo × ajuste_B
+                        img[0] = img[0] * b_factor * r_factor      # R: brightness x R adjustment
+                        img[1] = img[1] * b_factor * g_factor      # G: brightness x G adjustment
+                        img[2] = img[2] * b_factor * blue_factor   # B: brightness x B adjustment
                     elif img.shape[2] == 3:  # HWC (H, W, C)
                         img = img.clone()
                         img[:, :, 0] = img[:, :, 0] * b_factor * r_factor
                         img[:, :, 1] = img[:, :, 1] * b_factor * g_factor
                         img[:, :, 2] = img[:, :, 2] * b_factor * blue_factor
 
-                # Clamp para mantener rango válido
+                # Clamp to keep a valid range
                 img = torch.clamp(img, 0, 1 if img.max() <= 1 else 255)
 
         return img, target
@@ -230,7 +230,7 @@ class SyntheticDomainAdaptation(nn.Module):
 @register()
 class RandomBrightnessContrast(nn.Module):
     """
-    Ajuste más agresivo de brillo y contraste para domain adaptation.
+    More aggressive brightness and contrast adjustment for domain adaptation.
     """
     def __init__(self, brightness=(0.6, 1.2), contrast=(0.8, 1.2), p=0.5):
         super().__init__()
@@ -241,11 +241,11 @@ class RandomBrightnessContrast(nn.Module):
     def forward(self, img, target):
         if torch.rand(1) < self.p:
             if isinstance(img, torch.Tensor):
-                # Ajuste de brillo
+                # Brightness adjustment
                 b = torch.empty(1).uniform_(*self.brightness).item()
                 img = img * b
 
-                # Ajuste de contraste
+                # Contrast adjustment
                 c = torch.empty(1).uniform_(*self.contrast).item()
                 mean = img.mean()
                 img = (img - mean) * c + mean

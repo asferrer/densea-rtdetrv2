@@ -21,6 +21,34 @@ from ...core import register
 __all__ = ['CocoEvaluator',]
 
 
+# --- Optional fast evaluation (faster-coco-eval) -----------------------------
+# Enabled with FAST_COCOEVAL=1. Gives the same results as pycocotools
+# (difference < 1e-15 in stats and precision) but evaluates in C++. If the package
+# is not installed, it falls back to pycocotools with a warning.
+_FAST_COCOEVAL = os.environ.get("FAST_COCOEVAL", "0") == "1"
+if _FAST_COCOEVAL:
+    try:
+        from faster_coco_eval import COCOeval_faster
+    except ImportError:
+        print("FAST_COCOEVAL=1 but faster-coco-eval is not installed: using pycocotools")
+        _FAST_COCOEVAL = False
+
+
+def _fast_evaluate(coco_gt, results, img_ids, iou_type):
+    """Evaluate everything at once with faster-coco-eval and return the COCOeval object."""
+    with open(os.devnull, "w") as devnull:
+        with contextlib.redirect_stdout(devnull):
+            if results:
+                coco_eval = COCOeval_faster(coco_gt, COCO.loadRes(coco_gt, results), iou_type)
+            else:  # no detections: pycocotools, as in the normal path
+                coco_eval = COCOeval(coco_gt, COCO(), iouType=iou_type)
+            coco_eval.params.imgIds = list(img_ids)
+            coco_eval.evaluate()
+            coco_eval.accumulate()
+    return coco_eval
+
+
+
 @register()
 class CocoEvaluator(object):
     def __init__(self, coco_gt, iou_types):
@@ -39,6 +67,7 @@ class CocoEvaluator(object):
 
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
+        self._fast_results = {}
     
     def cleanup(self):
         self.coco_eval = {}
@@ -46,6 +75,7 @@ class CocoEvaluator(object):
             self.coco_eval[iou_type] = COCOeval(self.coco_gt, iouType=iou_type)
         self.img_ids = []
         self.eval_imgs = {k: [] for k in self.iou_types}
+        self._fast_results = {}
     
     
     def update(self, predictions):
@@ -54,6 +84,10 @@ class CocoEvaluator(object):
 
         for iou_type in self.iou_types:
             results = self.prepare(predictions, iou_type)
+
+            if _FAST_COCOEVAL:  # only accumulate; everything is evaluated in accumulate()
+                self._fast_results.setdefault(iou_type, []).extend(results)
+                continue
 
             # suppress pycocotools prints
             with open(os.devnull, 'w') as devnull:
@@ -68,11 +102,23 @@ class CocoEvaluator(object):
             self.eval_imgs[iou_type].append(eval_imgs)
 
     def synchronize_between_processes(self):
+        if _FAST_COCOEVAL:
+            for iou_type in self.iou_types:
+                gathered = dist_utils.all_gather(self._fast_results.get(iou_type, []))
+                self._fast_results[iou_type] = [r for part in gathered for r in part]
+            self.img_ids = sorted({int(i) for part in dist_utils.all_gather(self.img_ids) for i in part})
+            return
         for iou_type in self.iou_types:
             self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
             create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
 
     def accumulate(self):
+        if _FAST_COCOEVAL:
+            for iou_type in self.iou_types:
+                self.coco_eval[iou_type] = _fast_evaluate(
+                    self.coco_gt, self._fast_results.get(iou_type, []), self.img_ids, iou_type
+                )
+            return
         for coco_eval in self.coco_eval.values():
             coco_eval.accumulate()
 

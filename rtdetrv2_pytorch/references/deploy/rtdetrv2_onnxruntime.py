@@ -29,7 +29,7 @@ def main(args, ):
     providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
     sess = ort.InferenceSession(args.onnx_file, providers=providers)
     print(ort.get_device())
-    print("Execution Providers utilizados:", sess.get_providers())
+    print("Execution Providers in use:", sess.get_providers())
 
     im_pil = Image.open(args.im_file).convert('RGB')
     w, h = im_pil.size
