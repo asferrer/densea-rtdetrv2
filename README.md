@@ -32,6 +32,22 @@ Based on upstream commit [`70eed1e`](https://github.com/lyuwenyu/RT-DETR/commit/
   `references/deploy/build_engine.py` and the ONNX Runtime and TensorRT inference scripts, latency and complexity
   tools, tests.
 
+## Workflow
+
+The experiments are defined and evaluated in `densea-benchmark`; this repository trains one detector and writes its detections:
+
+```mermaid
+flowchart LR
+    BM["densea-benchmark<br/>training set of the experiment<br/>(COCO files)"] --> CFG["tools/make_densea_config.py<br/>YAML config"]
+    CFG --> TR["tools/train.py<br/>AdamW, EMA, early stopping<br/>selection on VAL"]
+    TR --> BEST["best.pth<br/>best EMA weights"]
+    BEST --> EV["tools/eval.py<br/>TEST, once"]
+    EV --> PRED["coco_predictions.json"]
+    PRED --> BOOT["densea-benchmark<br/>group bootstrap"]
+    BEST --> ONNX["tools/export_onnx.py"]
+    ONNX --> ENG["references/deploy/build_engine.py<br/>TensorRT FP16 or INT8"]
+```
+
 ## Installation
 
 With Docker (NVIDIA Container Toolkit and a GPU with 24 GB or more; the study used an RTX 5090 with batch size 32):
