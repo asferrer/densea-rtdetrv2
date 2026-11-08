@@ -89,7 +89,8 @@ python tools/eval.py  -c configs/generated/real_only_eval.yml -r /runs/real_only
     --output_dir /runs/real_only/eval_test -d cuda --coco_eval
 ```
 
-The first config uses the validation split for training and model selection; `real_only_eval.yml` points the
+During training, the first config evaluates on the validation split, which is used only for model selection (the model
+is trained on the training split); `real_only_eval.yml` points the
 evaluation dataloader to the test split, which is only used once, at the end, with `best.pth`. To resume an
 interrupted run, add `-r /runs/real_only/last.pth` to the training command.
 
